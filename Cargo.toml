@@ -1,0 +1,13 @@
+[package]
+name = "procflamegraph"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nix = { version = "0.29.0", features = ["ptrace", "signal", "fs"] }
+libc = { version = "0.2.169" }
+# signal-hook = { version = "0.3.17", features = ["channel"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

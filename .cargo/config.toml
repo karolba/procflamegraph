@@ -1,0 +1,16 @@
+# TODO: all of this should go to ./build-release.sh - the project still works on stable rust,
+#       albeit it produces a bit larger binary
+
+[unstable]
+# Make binary size lots smaller:
+build-std = ["std"]
+build-std-features = ["optimize_for_size"]
+
+[build]
+# Always make a statically-linked executable
+rustflags = [
+    "-Ctarget-feature=+crt-static",
+    "-Clink-self-contained=yes"
+]
+
+# target = ["aarch64-unknown-linux-musl"]
