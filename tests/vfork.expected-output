@@ -1,0 +1,5 @@
+Wahoo
+- ["artifacts/vfork"] -> 0
+  - ["artifacts/vfork", "--wahooo"] -> 123
+  - -> 50
+  - ["artifacts/vfork", "--self-exec"] -> 42
