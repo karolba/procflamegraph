@@ -1,4 +1,4 @@
-use crate::{TERMINATION_SIGNAL_CAUGHT, coroutines::CoroutineState, take_over_process, tracee::Tracee, unixutils};
+use crate::{TERMINATION_SIGNAL_CAUGHT, coroutines::CoroutineState, take_over_process, tracee::Tracee, unixutils, args};
 use WaitResult::{GotTerminationSignal, Result, WaitpidErr};
 use nix::{
     fcntl::AtFlags,
@@ -52,7 +52,7 @@ fn waitpid_or_signal(rusage: &mut libc::rusage) -> WaitResult {
             return GotTerminationSignal();
         }
         /*
-         * there is technically a rare right race here, if SIGTERM is received after the above compare and before
+         * there is technically a rare race right here, if SIGTERM is received after the above compare and before
          * waitpid is called waitpid won't return with an EINTR immediately.
          *
          * Fixing this would require calling sigprocmask before and after wait4, which would make the program
@@ -68,6 +68,29 @@ fn waitpid_or_signal(rusage: &mut libc::rusage) -> WaitResult {
             Err(nix::errno::Errno::EINTR) => {}
             Err(err) => return WaitpidErr(err),
         }
+    }
+}
+
+fn is_special_secure_exe_screwed(pid: nix::unistd::Pid, procfs_fd: BorrowedFd) -> bool {
+    if args().test_always_detach {
+        return true
+    }
+
+    let proc_dir = PathBuf::from(pid.to_string());
+
+    // todo: - file capabilities
+    //       - check the linux kernel source code - what else can enable AT_SECURE?
+    //
+    //         (or disable PTRACE_MODE_FSCREDS?? although that should be a separate thing??)
+
+    // fstatat can't fail with EINTR so it doesn't have to be restarted
+    match fstatat(Some(procfs_fd.as_raw_fd()), &proc_dir.join("exe"), AtFlags::empty()) {
+        Ok(res) => {
+            // todo - check gid (only if execute bit is set, mandatory file locking)
+            //      - check if we aren't the same user/group (so no secure mode anyway)
+            (res.st_mode & libc::S_ISUID) != 0
+        }
+        Err(_) => false, // ignore for now
     }
 }
 
@@ -116,31 +139,16 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, procfs_fd: BorrowedFd
             Result(PtraceEvent(child, SIGTRAP, PTRACE_EVENT_EXEC)) => {
                 let former_thread_id = ptrace::getevent(child).unwrap_or(-1);
 
-                let proc_dir = PathBuf::from(child.to_string());
-
-                // todo: - file capabilities
-                //       - check the linux kernel source code - what else can enable AT_SECURE?
-                //
-                //         (or disable PTRACE_MODE_FSCREDS?? although that should be a separate thing??)
-
-                // fstatat can't fail with EINTR so it doesn't have to be restarted
-                let is_special_secure = match fstatat(Some(procfs_fd.as_raw_fd()), &proc_dir.join("exe"), AtFlags::empty()) {
-                    Ok(res) => {
-                        // todo - check gid (only if execute bit is set, mandatory file locking)
-                        //      - check if we aren't the same user/group (so no secure mode anyway)
-                        (res.st_mode & libc::S_ISUID) != 0
-                    }
-                    Err(_) => false, // ignore for now
-                };
+                let child_proc_dir = PathBuf::from(child.to_string());
 
                 // keep the _fd to close it at the end of the function, just after cont
                 // (to get to cont faster)
-                let (cmdline, _fd) = match unixutils::read_restart_on_eintr_delay_close(Some(procfs_fd), &proc_dir.join("cmdline")) {
+                let (cmdline, _fd) = match unixutils::read_restart_on_eintr_delay_close(Some(procfs_fd), &child_proc_dir.join("cmdline")) {
                     Ok((cmdline, fd)) => (cmdline, Some(fd)),
                     Err(_) => (vec![b'?'], None), // ignore errors - process could have just died.
                 };
 
-                if is_special_secure {
+                if is_special_secure_exe_screwed(child, procfs_fd) {
                     // stop at the next syscall. We'll hijack the process and set it up to reexec and detach
                     ptrace::syscall(child, None).ok();
                 } else {

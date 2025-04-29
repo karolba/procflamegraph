@@ -7,6 +7,7 @@ pub(crate) struct Args {
     pub(crate) display_pids: bool,
     pub(crate) display_times: bool,
     pub(crate) display_threads: bool,
+    pub(crate) test_always_detach: bool,
 }
 
 impl Args {
@@ -17,6 +18,7 @@ impl Args {
             display_pids: false,
             display_times: false,
             display_threads: false,
+            test_always_detach: false,
         }
     }
 }
@@ -54,12 +56,13 @@ pub(crate) fn parse_args() -> Args {
 
     while let Some(arg) = parser.next().unwrap_or_else(|err| argument_parsing_error_usage(&name, &*err.to_string())) {
         match arg {
-            Short('p') | Long("pids")  => args.display_pids = true,
-            Long("no-pids")            => args.display_pids = false,
-            Short('t') | Long("times") => args.display_times = true,
-            Long("no-times")           => args.display_times = false,
-            Long("show-threads")       => args.display_threads = true,
-            Long("no-show-threads")    => args.display_threads = false,
+            Short('p') | Long("pids")   => args.display_pids = true,
+            Long("no-pids")             => args.display_pids = false,
+            Short('t') | Long("times")  => args.display_times = true,
+            Long("no-times")            => args.display_times = false,
+            Long("show-threads")        => args.display_threads = true,
+            Long("no-show-threads")     => args.display_threads = false,
+            Long("_test-always-detach") => args.test_always_detach = true,
             Short('h') | Long("help") => {
                 usage(&name);
                 std::process::exit(0);
