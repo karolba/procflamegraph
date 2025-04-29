@@ -1,0 +1,24 @@
+[toolchain]
+channel = "nightly-2025-04-25"
+
+# To be able to compile the std library ourselves for a 50% binary size reduction
+components = ["rust-src"]
+
+targets = [
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+
+    # Targets we could support:
+    #"arm-unknown-linux-musleabi",
+    #"arm-unknown-linux-musleabihf",
+    #"armv5te-unknown-linux-musleabi",
+    #"armv7-unknown-linux-musleabi",
+    #"armv7-unknown-linux-musleabihf",
+    #"i586-unknown-linux-musl",
+    #"i686-unknown-linux-musl",
+    #"loongarch64-unknown-linux-musl",
+    #"powerpc64le-unknown-linux-musl",
+    #"riscv64gc-unknown-linux-musl",
+]
+
+profile = "minimal"
