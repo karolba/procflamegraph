@@ -225,7 +225,7 @@ fn main() -> std::process::ExitCode {
     // do this before setting up signal handlers to not have to worry about EINTR
     // and before run_in_fork to fail early
     let proc_dir_fd =
-        unixutils::openat_to_ownedfd(None, "/proc", OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC, Mode::empty())
+        nix::fcntl::openat(nix::fcntl::AT_FDCWD, "/proc", OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC, Mode::empty())
             .unwrap_or_else(|err| error_out!("Can't access /proc: {}", err));
 
     // safety: can only fork like that at the beginning when no other threads are yet running

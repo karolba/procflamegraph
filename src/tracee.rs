@@ -128,7 +128,7 @@ impl Tracee {
         use bstr::ByteSlice;
 
         let path = PathBuf::from(self.pid.to_string()).join("stat");
-        let (bytes, fd) = unixutils::read_restart_on_eintr_delay_close(Some(procfs), path.as_path())?;
+        let (bytes, fd) = unixutils::read_restart_on_eintr_delay_close(procfs, path.as_path())?;
 
         let after_rparen_idx: usize = match bytes.rfind_byte(b')') {
             Some(x) => x + 2,

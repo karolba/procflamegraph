@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::path::Path;
 use libc::c_int;
 use nix::errno::Errno;
@@ -7,16 +7,9 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::sys::wait::WaitStatus::StillAlive;
 use nix::unistd::Pid;
 
-pub(crate) fn openat_to_ownedfd<P: ?Sized + nix::NixPath>(
-    dirfd: Option<RawFd>,
-    path: &P,
-    oflag: nix::fcntl::OFlag,
-    mode: nix::sys::stat::Mode,
-) -> nix::Result<OwnedFd> {
-    nix::fcntl::openat(dirfd, path, oflag, mode).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-fn read_to_maybe_uninit(fd: RawFd, buf: &mut [std::mem::MaybeUninit<u8>]) -> nix::Result<usize> {
+fn read_to_maybe_uninit(fd: BorrowedFd, buf: &mut [std::mem::MaybeUninit<u8>]) -> nix::Result<usize> {
+    use std::os::fd::AsRawFd;
+    let fd = fd.as_raw_fd();
     let len = buf.len() as libc::size_t;
     let buf = buf.as_mut_ptr() as *mut c_void;
     Errno::result(unsafe { libc::read(fd, buf, len) }).map(|r| r as usize)
@@ -29,12 +22,12 @@ fn read_to_maybe_uninit(fd: RawFd, buf: &mut [std::mem::MaybeUninit<u8>]) -> nix
 // a small optimisation: returns the OwnedFd that close()s the /proc/*/cmdline fd
 // since the latency to PTRACE_CONT is what matters the most to us, letting our tracees continue
 // This really could be a better designed api though, maybe take a closure and close() after the closure?
-pub(crate) fn read_restart_on_eintr_delay_close(dirfd: Option<BorrowedFd>, path: &Path) -> Result<(Vec<u8>, OwnedFd), std::io::Error> {
+pub(crate) fn read_restart_on_eintr_delay_close(dirfd: BorrowedFd, path: &Path) -> Result<(Vec<u8>, OwnedFd), std::io::Error> {
     use nix::fcntl::OFlag;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::AsFd;
 
     let fd: OwnedFd = loop {
-        match openat_to_ownedfd(dirfd.map(|d| d.as_raw_fd()), path, OFlag::O_RDONLY | OFlag::O_CLOEXEC, nix::sys::stat::Mode::empty()) {
+        match nix::fcntl::openat(dirfd, path, OFlag::O_RDONLY | OFlag::O_CLOEXEC, nix::sys::stat::Mode::empty()) {
             Ok(fd) => break fd,
             Err(Errno::EINTR) => (),
             Err(err) => Err(err)?,
@@ -45,7 +38,7 @@ pub(crate) fn read_restart_on_eintr_delay_close(dirfd: Option<BorrowedFd>, path:
     let mut data: Vec<u8> = Vec::with_capacity(64);
 
     loop {
-        match read_to_maybe_uninit(fd.as_raw_fd(), data.spare_capacity_mut()) {
+        match read_to_maybe_uninit(fd.as_fd(), data.spare_capacity_mut()) {
             Ok(0) => break,
             Ok(num) => {
                 let read_was_exact = num == data.capacity();
@@ -62,7 +55,7 @@ pub(crate) fn read_restart_on_eintr_delay_close(dirfd: Option<BorrowedFd>, path:
 }
 
 // same as read_restart_on_eintr_delay_close but don't delay closing
-pub(crate) fn read_restart_on_eintr(dirfd: Option<BorrowedFd>, path: &Path) -> Result<Vec<u8>, std::io::Error> {
+pub(crate) fn read_restart_on_eintr(dirfd: BorrowedFd, path: &Path) -> Result<Vec<u8>, std::io::Error> {
     match read_restart_on_eintr_delay_close(dirfd, path) {
         Ok((vec, _fd)) => Ok(vec),
         Err(err) => Err(err),

@@ -116,7 +116,7 @@ pub(crate) gen fn take_over_process_syscall(tracee: Tracee, procfs: BorrowedFd<'
     let argv_array_offset: u64 = memory_to_inject.len() as u64 * machine_word_size;
     let path = PathBuf::from(tracee.pid.to_string()).join("cmdline");
     // todo: should this be a read_restart_on_eintr_delay_close?
-    let argv = match unixutils::read_restart_on_eintr(Some(procfs), path.as_path()) {
+    let argv = match unixutils::read_restart_on_eintr(procfs, path.as_path()) {
         Err(e) => {
             eprintln!("Warning: Could not read /proc/{}/cmdline: {}", tracee.pid, e);
             co_return!(false);
@@ -134,7 +134,7 @@ pub(crate) gen fn take_over_process_syscall(tracee: Tracee, procfs: BorrowedFd<'
     let envp_array_offset: u64 = memory_to_inject.len() as u64 * machine_word_size;
     let path = PathBuf::from(tracee.pid.to_string()).join("environ");
     // todo: should this be a read_restart_on_eintr_delay_close?
-    let envp = match unixutils::read_restart_on_eintr(Some(procfs), path.as_path()) {
+    let envp = match unixutils::read_restart_on_eintr(procfs, path.as_path()) {
         Err(e) => {
             eprintln!("Warning: Could not read /proc/{}/environ: {}", tracee.pid, e);
             co_return!(false);

@@ -6,7 +6,7 @@ use nix::{
 };
 use std::{
     collections::HashMap,
-    os::fd::{AsRawFd, BorrowedFd},
+    os::fd::BorrowedFd,
     path::PathBuf,
     sync::atomic::Ordering,
 };
@@ -84,7 +84,7 @@ fn is_special_secure_exe_screwed(pid: nix::unistd::Pid, procfs_fd: BorrowedFd) -
     //         (or disable PTRACE_MODE_FSCREDS?? although that should be a separate thing??)
 
     // fstatat can't fail with EINTR so it doesn't have to be restarted
-    match fstatat(Some(procfs_fd.as_raw_fd()), &proc_dir.join("exe"), AtFlags::empty()) {
+    match fstatat(procfs_fd, &proc_dir.join("exe"), AtFlags::empty()) {
         Ok(res) => {
             // todo - check gid (only if execute bit is set, mandatory file locking)
             //      - check if we aren't the same user/group (so no secure mode anyway)
@@ -143,7 +143,7 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, procfs_fd: BorrowedFd
 
                 // keep the _fd to close it at the end of the function, just after cont
                 // (to get to cont faster)
-                let (cmdline, _fd) = match unixutils::read_restart_on_eintr_delay_close(Some(procfs_fd), &child_proc_dir.join("cmdline")) {
+                let (cmdline, _fd) = match unixutils::read_restart_on_eintr_delay_close(procfs_fd, &child_proc_dir.join("cmdline")) {
                     Ok((cmdline, fd)) => (cmdline, Some(fd)),
                     Err(_) => (vec![b'?'], None), // ignore errors - process could have just died.
                 };
