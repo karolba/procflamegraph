@@ -1,0 +1,20 @@
+./procflamegraph --help
+Usage: ./procflamegraph [-pt] [-o file] [--] command [arg...]
+       ./procflamegraph [-h|--help]
+Options:
+ -h      --help        - display this help message
+ -o FILE --output=FILE - output the process tree to a file instead of stdout
+ -p      --pids        - display PIDs in the process tree
+         --no-pids     - don't display PIDs in the process tree (default)
+ -t      --times       - display how long a process took to execute in the process tree
+         --no-times    - don't display how long a process took to execute in the process tree (default)
+./procflamegraph -h
+Usage: ./procflamegraph [-pt] [-o file] [--] command [arg...]
+       ./procflamegraph [-h|--help]
+Options:
+ -h      --help        - display this help message
+ -o FILE --output=FILE - output the process tree to a file instead of stdout
+ -p      --pids        - display PIDs in the process tree
+         --no-pids     - don't display PIDs in the process tree (default)
+ -t      --times       - display how long a process took to execute in the process tree
+         --no-times    - don't display how long a process took to execute in the process tree (default)
