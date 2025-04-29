@@ -1,0 +1,5 @@
+Wahoo
+- ["artifacts/simple"] -> 0
+  - -> 123
+  - -> 0
+  - ["artifacts/simple", "--self-exec"] -> 42

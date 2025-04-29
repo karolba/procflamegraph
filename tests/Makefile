@@ -2,7 +2,7 @@ BIN           ?= ../release-procflamegraph
 VERBOSE       ?= 0
 CXXFLAGS      ?= -std=gnu++23 -Wall -Wextra
 TEST_BINARIES := $(patsubst %.cpp,artifacts/%,$(wildcard *.cpp))
-TESTS         := $(patsubst %.sh,test/%,$(wildcard *.sh))
+TESTS         := $(patsubst %.expected-output,test/%,$(wildcard *.expected-output))
 
 ifeq '$(VERBOSE)' '0'
   Q := @

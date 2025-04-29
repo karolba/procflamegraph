@@ -27,7 +27,7 @@ use std::{
 use nix::sys::signal::Signal;
 
 static ARGS : OnceLock<args::Args> = OnceLock::new();
-fn args() -> &'static args::Args {
+pub(crate) fn args() -> &'static args::Args {
     ARGS.get().unwrap()
 }
 
@@ -76,7 +76,7 @@ impl Process {
     }
 
     fn print_tree(&self, indent: usize, others: &HashMap<nix::unistd::Pid, Process>, out: &mut dyn Write) -> Result<(), std::io::Error> {
-        if self.execvs.is_empty() && matches!(self.exit, Some(ExitReason::NormalExit{ exit_code: 0 })) {
+        if !args().display_threads && self.execvs.is_empty() && matches!(self.exit, Some(ExitReason::NormalExit{ exit_code: 0 })) {
             // collapse worker threads that didn't contribute anything and only muddy out the output
             // todo maybe add an option to disable this behaviour (select a cool name first tho)
             for child in self.children.iter() {
