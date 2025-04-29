@@ -18,11 +18,11 @@ endif
 all: $(TEST_BINARIES) $(TESTS)
 
 procflamegraph: $(BIN)
-	$(Q)ln -s $(BIN) procflamegraph
+	$(Q)ln -fs $(BIN) procflamegraph
 
 artifacts/%: %.cpp common.hpp Makefile
 	$(Q)mkdir -p artifacts
-	$(Q)$(CXX) $(CXXFLAGS) $(*F).cpp -o $@
+	$(CXX) $(CXXFLAGS) $(*F).cpp -o $@
 
 artifacts/%.result: $(TEST_BINARIES) Makefile procflamegraph
 	$(Q)mkdir -p artifacts

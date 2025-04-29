@@ -26,7 +26,7 @@ cargo-tests:
 
 .PHONY: integration-tests
 integration-tests:
-	$(ORB) make -k -j $$(nproc) -C tests BIN=../target/$(TARGET)/debug/procflamegraph
+	@$(ORB) make -k -j $$(nproc) -C tests BIN=../target/$(TARGET)/debug/procflamegraph
 
 .PHONY: release
 release:
