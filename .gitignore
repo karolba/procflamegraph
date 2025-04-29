@@ -1,3 +1,10 @@
+# cargo
+/debug
 /target
+
+# integration tests
 /tests/artifacts/
 /tests/procflamegraph
+
+# RustRover
+/.idea
