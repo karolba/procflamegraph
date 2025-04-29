@@ -11,13 +11,12 @@ nix = { version = "0.29.0", features = [
     "uio",
     "process",
 ] }
-libc = "0.2.169"
-lexopt = "0.3.0"
-bstr = { version = "1.11.3", default-features = false, features = [
+libc = "0.2.172"
+lexopt = "0.3.1"
+bstr = { version = "1.12.0", default-features = false, features = [
     "std",
-    "alloc",
 ] }
-bytemuck = "1.21.0"
+bytemuck = "1.23.0"
 
 [profile.release]
 lto = true
