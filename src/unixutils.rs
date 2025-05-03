@@ -89,3 +89,16 @@ pub(crate) fn wait4<P: Into<Option<Pid>>>(
         res => WaitStatus::from_raw(Pid::from_raw(res), status),
     }
 }
+
+pub(crate) fn kernel_major_minor() -> Option<(u32, u32)> {
+    let uname = nix::sys::utsname::uname().ok()?;
+    let release = uname.release().to_string_lossy();
+
+    let major_length = release.find(|c| c == '.')?;
+    let minor_length = release[major_length+1..].find(|c| c == '.')?;
+
+    let major = str::parse::<u32>(&release[0..major_length]).ok()?;
+    let minor = str::parse::<u32>(&release[major_length+1..major_length+1+minor_length]).ok()?;
+
+    Some((major, minor))
+}

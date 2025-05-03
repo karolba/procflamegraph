@@ -214,11 +214,27 @@ fn ignore_termination_signals() {
     unsafe { signal::sigaction(signal::SIGINT, &ignore_sigaction) }.expect("Couldn't reset the SIGINT handler");
 }
 
+fn warn_on_an_old_kernel() {
+    let (major, minor) = match unixutils::kernel_major_minor() {
+        Some(version) => version,
+        None => return, // if we couldn't get the kernel version for some reason, ignore it
+    };
+
+    // Version requirements:
+    // - Linux 5.3 for PTRACE_GET_SYSCALL_INFO
+    // - Linux 5.6 for pidfd_getfd
+    if major < 5 || (major == 5 && minor <= 6) {
+        eprintln!("{}: Warning: The lowest required Linux version is 5.6 - you are running {major}.{minor}", args().our_name);
+    }
+}
+
 fn main() -> std::process::ExitCode {
     use nix::{
         fcntl::OFlag,
         sys::stat::Mode
     };
+
+    warn_on_an_old_kernel();
 
     ARGS.set(args::parse_args()).ok();
 

@@ -22,7 +22,8 @@ build:
 
 .PHONY: cargo-tests
 cargo-tests:
-	@$(ORB) cargo test --target $(TARGET)
+	@# no tests yet
+	@#$(ORB) cargo test --target $(TARGET)
 
 .PHONY: integration-tests
 integration-tests:
