@@ -24,6 +24,9 @@ artifacts/%: %.cpp common.hpp Makefile
 	$(Q)mkdir -p artifacts
 	$(CXX) $(CXXFLAGS) $(*F).cpp -o $@
 
+# Extra flags
+artifacts/no-main: CXXFLAGS += -nostdlib -static
+
 artifacts/%.result: $(TEST_BINARIES) Makefile procflamegraph
 	$(Q)mkdir -p artifacts
 	$(Q)./$(*F).sh ./procflamegraph > $@
