@@ -1,11 +1,11 @@
-use crate::{TERMINATION_SIGNAL_CAUGHT, coroutines::CoroutineState, take_over_process, tracee::Tracee, unixutils, args};
+use crate::{TERMINATION_SIGNAL_CAUGHT, coroutines::CoroutineState, take_over_process, tracee::Tracee, unixutils, args, errors::log_warn};
 use WaitResult::{GotTerminationSignal, Result, WaitpidErr};
 use nix::{
     fcntl::AtFlags,
     sys::{ptrace, signal, stat::fstatat, wait::WaitStatus, signal::Signal},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     os::fd::BorrowedFd,
     path::PathBuf,
     sync::atomic::Ordering,
@@ -124,9 +124,10 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, procfs_fd: BorrowedFd
         match waitpid_or_signal(&mut rusage) {
             GotTerminationSignal() => {
                 // todo: this is for easier killing everything when debugging
-                pids_to_kill.iter().for_each(|pid| {
-                    signal::kill(pid.clone(), SIGKILL).ok();
-                })
+                //pids_to_kill.iter().for_each(|pid| {
+                 //   signal::kill(pid.clone(), SIGKILL).ok();
+                //})
+                println!("Got a termination signal, todo handle it")
             }
             Result(Stopped(child, SIGSTOP)) => {
                 setup_ptrace_for_child(child);
@@ -141,15 +142,24 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, procfs_fd: BorrowedFd
 
                 let child_proc_dir = PathBuf::from(child.to_string());
 
-                // keep the _fd to close it at the end of the function, just after cont
-                // (to get to cont faster)
+                // keep the _fd to close it at the end of the block, after ptrace::cont or
+                // ptrace::syscall (to get to resuming the process execution just a tiny bit faster)
                 let (cmdline, _fd) = match unixutils::read_restart_on_eintr_delay_close(procfs_fd, &child_proc_dir.join("cmdline")) {
                     Ok((cmdline, fd)) => (cmdline, Some(fd)),
-                    Err(_) => (vec![b'?'], None), // ignore errors - process could have just died.
+                    Err(_) => (vec![b'?'], None), // ignore errors - the process could have just died.
                 };
 
-                if is_special_secure_exe_screwed(child, procfs_fd) {
-                    // stop at the next syscall. We'll hijack the process and set it up to reexec and detach
+                let take_over_actions = take_over_process::TakeOverActions{
+                    tracee: Tracee::from(child),
+                    procfs: procfs_fd,
+                    do_redirect_stderr: args().capture_stderr,
+                    do_reexec: is_special_secure_exe_screwed(child, procfs_fd),
+                };
+
+                if take_over_actions.is_any_action_set() {
+                    take_over_process_coroutinies.insert(child, take_over_actions.take_over_step());
+
+                    // stop at the next syscall. We'll hijack the process and set it up for shenanigans
                     ptrace::syscall(child, None).ok();
                 } else {
                     cont(child, None).ok(); // ignore errors - the child could have died
@@ -164,15 +174,46 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, procfs_fd: BorrowedFd
             }
 
             Result(PtraceSyscall(child)) => {
-                let coroutine = take_over_process_coroutinies
-                    .entry(child)
-                    .or_insert_with(|| take_over_process::take_over_process_syscall(Tracee::from(child), procfs_fd));
-                let _ = match coroutine.next() {
-                    Some(CoroutineState::Complete(true)) => ptrace::detach(child, None),
-                    Some(CoroutineState::Complete(false)) => cont(child, None),
-                    // There's still syscalls to inject:
-                    Some(CoroutineState::Yielded(())) => ptrace::syscall(child, None),
-                    None => cont(child, None),
+                match take_over_process_coroutinies.get_mut(&child).and_then(|coroutine| coroutine.next()) {
+                    Some(CoroutineState::Complete(Ok(take_over_process::TakeOverResult::ContinueExecuting()))) => {
+                        // Our modifications to the process have been done. Let the child continue
+                        // executing normally, without stopping on syscalls.
+                        cont(child, None).ok();
+
+                        // The coroutine is over, no longer need it
+                        take_over_process_coroutinies.remove(&child);
+                    },
+
+                    Some(CoroutineState::Complete(Ok(take_over_process::TakeOverResult::ReexecSetupDetach()))) => {
+                        // The self-reexec setup dance is done - the process is set up for
+                        // reexecuting itself, this time, without being attached to.
+                        // Detach to let it continue doing so.
+                        ptrace::detach(child, None).ok();
+
+                        // The coroutine is over, no longer need it
+                        take_over_process_coroutinies.remove(&child);
+                    },
+
+                    Some(CoroutineState::Complete(Err(_))) => {
+                        // something has failed, we cannot restart 
+                        //
+                        // be mindful - could this also just mean the child died mid our request?
+                        // TODO: log the error
+                        cont(child, None).ok();
+
+                        // The coroutine is over, no longer need it
+                        take_over_process_coroutinies.remove(&child);
+                    },
+
+                    Some(CoroutineState::Yielded(())) => {
+                        // There's still syscalls we have left to inject, continue executing but
+                        // stop on the next syscall exit or entry
+                        ptrace::syscall(child, None);
+                    },
+
+                    None => {
+                        log_warn!("Received a syscall-stop for pid {} but didn't request one", child);
+                    },
                 };
             }
 

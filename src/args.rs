@@ -9,6 +9,7 @@ pub(crate) struct Args {
     pub(crate) display_times: bool,
     pub(crate) display_threads: bool,
     pub(crate) test_always_detach: bool,
+    pub(crate) capture_stderr: bool,
 }
 
 impl Args {
@@ -21,6 +22,7 @@ impl Args {
             display_times: false,
             display_threads: false,
             test_always_detach: false,
+            capture_stderr: false,
         }
     }
 }
@@ -33,14 +35,16 @@ fn usage(application_name: &str) {
     let _ = writeln!(b, "Usage: {application_name} [-pt] [-o file] [--] command [arg...]");
     let _ = writeln!(b, "       {application_name} [-h|--help]");
     let _ = writeln!(b, "Options:");
-    let _ = writeln!(b, " -h      --help            - display this help message");
-    let _ = writeln!(b, " -o FILE --output=FILE     - output the process tree to a file instead of stdout");
-    let _ = writeln!(b, " -p      --pids            - display PIDs in the process tree");
-    let _ = writeln!(b, "         --no-pids         - don't display PIDs in the process tree (default)");
-    let _ = writeln!(b, " -t      --times           - display how long a process took to execute in the process tree");
-    let _ = writeln!(b, "         --no-times        - don't display how long a process took to execute in the process tree (default)");
-    let _ = writeln!(b, "         --show-threads    - show threads alongside processes");
-    let _ = writeln!(b, "         --no-show-threads - don't show threads alongside processes (default)");
+    let _ = writeln!(b, " -h      --help              - display this help message");
+    let _ = writeln!(b, " -o FILE --output=FILE       - output the process tree to a file instead of stdout");
+    let _ = writeln!(b, " -p      --pids              - display PIDs in the process tree");
+    let _ = writeln!(b, "         --no-pids           - don't display PIDs in the process tree (default)");
+    let _ = writeln!(b, " -t      --times             - display how long a process took to execute in the process tree");
+    let _ = writeln!(b, "         --no-times          - don't display how long a process took to execute in the process tree (default)");
+    let _ = writeln!(b, "         --show-threads      - show threads alongside processes");
+    let _ = writeln!(b, "         --no-show-threads   - don't show threads alongside processes (default)");
+    let _ = writeln!(b, "         --capture-stderr    - show stderr from all child processes");
+    let _ = writeln!(b, "         --no-capture-stderr - don't show stderr from all child processes processes (default)");
 }
 
 fn argument_parsing_error_usage(application_name: &str, err: &str) -> ! {
@@ -64,6 +68,8 @@ pub(crate) fn parse_args() -> Args {
             Long("no-times")            => args.display_times = false,
             Long("show-threads")        => args.display_threads = true,
             Long("no-show-threads")     => args.display_threads = false,
+            Long("capture-stderr")      => args.capture_stderr = true,
+            Long("no-capture-stderr")   => args.capture_stderr = false,
             Long("_test-always-detach") => args.test_always_detach = true,
             Short('h') | Long("help") => {
                 usage(&args.our_name);
