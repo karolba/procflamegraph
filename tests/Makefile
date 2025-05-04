@@ -1,8 +1,8 @@
-BIN           ?= ../release-procflamegraph
-VERBOSE       ?= 0
-CXXFLAGS      ?= -std=gnu++23 -Wall -Wextra
-TEST_BINARIES := $(patsubst %.cpp,artifacts/%,$(wildcard *.cpp))
-TESTS         := $(patsubst %.expected-output,test/%,$(wildcard *.expected-output))
+BIN             ?= ../release-procflamegraph
+VERBOSE         ?= 0
+CXXFLAGS        ?= -std=gnu++23 -Wall -Wextra
+HELPER_BINARIES := $(patsubst helpers/%.cpp,artifacts/%,$(wildcard helpers/*.cpp))
+TESTS           := $(patsubst %.expected-output,test/%,$(wildcard *.expected-output))
 
 ifeq '$(VERBOSE)' '0'
   Q := @
@@ -15,19 +15,19 @@ ifeq '$(VERBOSE)' '2'
 endif
 
 .PHONY: all
-all: $(TEST_BINARIES) $(TESTS)
+all: $(HELPER_BINARIES) $(TESTS)
 
 procflamegraph: $(BIN)
 	$(Q)ln -fs $(BIN) procflamegraph
 
-artifacts/%: %.cpp common.hpp Makefile
+artifacts/%: helpers/%.cpp common.hpp Makefile
 	$(Q)mkdir -p artifacts
-	$(CXX) $(CXXFLAGS) $(*F).cpp -o $@
+	$(CXX) $(CXXFLAGS) helpers/$(*F).cpp -o $@
 
 # Extra flags
 artifacts/no-main: CXXFLAGS += -nostdlib -static
 
-artifacts/%.result: $(TEST_BINARIES) Makefile procflamegraph
+artifacts/%.result: $(HELPER_BINARIES) Makefile procflamegraph
 	$(Q)mkdir -p artifacts
 	$(Q)./$(*F).sh ./procflamegraph > $@
 
@@ -37,6 +37,6 @@ test/%: artifacts/%.result %.expected-output
 
 .PHONY: clean
 clean:
-	$(Q)rm -fv $(TEST_BINARIES) $(TESTS:test/%=artifacts/%.result)
+	$(Q)rm -fv $(HELPER_BINARIES) $(TESTS:test/%=artifacts/%.result)
 
 
