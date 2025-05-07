@@ -208,7 +208,7 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, procfs_fd: BorrowedFd
                     Some(CoroutineState::Yielded(())) => {
                         // There's still syscalls we have left to inject, continue executing but
                         // stop on the next syscall exit or entry
-                        ptrace::syscall(child, None);
+                        ptrace::syscall(child, None).ok();
                     },
 
                     None => {

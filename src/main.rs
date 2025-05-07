@@ -1,9 +1,13 @@
 #![feature(gen_blocks)]
 
+// disable unused imports and dead code warnings from debug builds
+// I wish this was user-configurable, instead of having it in the code
+#![cfg_attr(debug_assertions, allow(dead_code, unused_imports))]
+
 // has macros, needs to go first
 mod errors;
 mod coroutines;
-use errors::error_out;
+use errors::{error_out,log_warn};
 
 mod args;
 mod ptrace_syscall_info;
@@ -224,7 +228,7 @@ fn warn_on_an_old_kernel() {
     // - Linux 5.3 for PTRACE_GET_SYSCALL_INFO
     // - Linux 5.6 for pidfd_getfd
     if major < 5 || (major == 5 && minor <= 6) {
-        eprintln!("{}: Warning: The lowest required Linux version is 5.6 - you are running {major}.{minor}", args().our_name);
+        log_warn!("The lowest required Linux version is 5.6 - you are running {}.{}", major, minor);
     }
 }
 
@@ -234,9 +238,9 @@ fn main() -> std::process::ExitCode {
         sys::stat::Mode
     };
 
-    warn_on_an_old_kernel();
-
     ARGS.set(args::parse_args()).ok();
+
+    warn_on_an_old_kernel();
 
     // do this before setting up signal handlers to not have to worry about EINTR
     // and before run_in_fork to fail early

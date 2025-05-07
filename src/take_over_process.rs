@@ -1,6 +1,6 @@
 // Use `gen` blocks as crude coroutines
 
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, OwnedFd, BorrowedFd};
 use std::path::PathBuf;
 use std::error::Error;
 
@@ -8,6 +8,8 @@ use crate::coroutines::{CoroutineState, co_return, co_try, co_yield, co_yield_fr
 use crate::ptrace_syscall_info::{SyscallEntry, SyscallExit, SyscallOp};
 use crate::tracee::{ArgvEnvpAddrs, PokeResult, Tracee};
 use crate::unixutils;
+
+use nix::sys::ptrace;
 
 
 // todo: change this wait_* stuff for `next_syscall`
@@ -97,6 +99,7 @@ impl TakeOverActions<'_> {
         let original_syscall_entry: SyscallEntry = co_yield_from!(wait_for_syscall_entry(self.tracee)).expect("TODO");
         let original_regset = self.tracee.getregset().unwrap_or_else(|_| todo!("check this error"));
         let redo_syscall_again_regset = roll_instruction_pointer_back_over_syscall_instruction(original_regset);
+
             
         if self.do_redirect_stderr {
             co_try!(co_yield_from!(self.redirect_stderr(redo_syscall_again_regset)));
@@ -117,24 +120,114 @@ impl TakeOverActions<'_> {
         self.tracee.set_syscall_arg_regs(regset, syscall_entry).expect("TODO");
     }
 
+    gen fn close_two_file_descriptors(self, base_regset: libc::user_regs_struct, fd1: i32, fd2: i32) -> CoroutineState<(), Result<(), TakeOverError>> {
+        if fd1 + 1 == fd2 || fd1 - 1 == fd2 /* TODO: AND ON LINUX 5.9 AT LEAST! */ {
+            // todo: close on linux always cleans the file dsecriptor (even if we get an EINTR),
+            // only EBADF is a real bad error
+            let res: SyscallExit = co_yield_from!(syscall(self.tracee, base_regset, SyscallEntry {
+                nr: libc::SYS_close_range as u64,
+                args: [
+                    i32::min(fd1, fd2) as u64, 
+                    i32::max(fd1, fd2) as u64,
+                    0u64, // flags
+                    0u64, // nothing
+                    0u64, // nothing
+                    0u64, // nothing
+                ]
+            })).expect("TODO");
+            if res.is_error != 0 {
+                todo!();
+            }
+        } else {
+            // todo: close on linux always cleans the file dsecriptor (even if we get an EINTR),
+            // only EBADF is a real bad error
+            let res: SyscallExit = co_yield_from!(syscall(self.tracee, base_regset, SyscallEntry {
+                nr: libc::SYS_close as u64,
+                args: [
+                    fd1 as u64,
+                    0u64, // nothing
+                    0u64, // nothing
+                    0u64, // nothing
+                    0u64, // nothing
+                    0u64, // nothing
+                ]
+            })).expect("TODO");
+            if res.is_error != 0 {
+                todo!();
+            }
+
+            // todo: restart on eintr ..
+            let res: SyscallExit = co_yield_from!(syscall(self.tracee, base_regset, SyscallEntry {
+                nr: libc::SYS_close as u64,
+                args: [
+                    fd2 as u64,
+                    0u64, // nothing
+                    0u64, // nothing
+                    0u64, // nothing
+                    0u64, // nothing
+                    0u64, // nothing
+                ]
+            })).expect("TODO");
+            if res.is_error != 0 {
+                todo!();
+            }
+        }
+
+        co_return!(Ok(()));
+    }
+
     gen fn redirect_stderr(self, base_regset: libc::user_regs_struct) -> CoroutineState<(), Result<(), TakeOverError>> {
         // todo: don't panic if the child doesn't have stderr or stdout fds
         // this could legitimately happen
 
+        let procfd = unixutils::pidfd_open(self.tracee.pid.as_raw(), 0).expect("todo");
+
+        let childs_original_stderr = unixutils::pidfd_getfd(procfd.as_fd(), libc::STDERR_FILENO, 0).expect("todo");
+
+        // use the top of the stack as a temporary storage for the result of pipe2(2)
+        let stack_pointer = base_regset.sp;
+        let original_sp_value = ptrace::read(self.tracee.pid, stack_pointer as *mut libc::c_void).expect("todo read at sp");
+
         let duped: SyscallExit = co_yield_from!(syscall(self.tracee, base_regset, SyscallEntry {
-            nr: libc::SYS_dup as u64,
+            nr: libc::SYS_pipe2 as u64,
             args: [
-                1u64, // stderr
-                2u64, // to (stderr)
+                stack_pointer, // the address where fd[0] and fd[1] are gonna be placed
                 0u64, // flags
-                0u64, // NULL
-                0u64, // NULL
-                0u64, // NULL
+                0u64, // nothing
+                0u64, // nothing
+                0u64, // nothing
+                0u64, // nothing
             ]
         })).expect("TODO");
         if duped.is_error != 0 {
             todo!();
         }
+
+        let [pipe_read_end_in_child, pipe_write_end_in_child] =
+            ptrace::read(self.tracee.pid, stack_pointer as *mut libc::c_void)
+            .map(|word: i64| unsafe { std::mem::transmute::<i64, [i32; 2]>(word) })
+            .expect("todo read at sp");
+
+        let read_pipe: OwnedFd = unixutils::pidfd_getfd(procfd.as_fd(), pipe_read_end_in_child, 0).expect("todo");
+
+        let duped: SyscallExit = co_yield_from!(syscall(self.tracee, base_regset, SyscallEntry {
+            nr: libc::SYS_dup3 as u64,
+            args: [
+                pipe_write_end_in_child as u64, // oldfd
+                libc::STDERR_FILENO as u64, // newfd
+                0u64, // flags
+                0u64, // nothing
+                0u64, // nothing
+                0u64, // nothing
+            ]
+        })).expect("TODO");
+        if duped.is_error != 0 {
+            todo!();
+        }
+
+        co_try!(co_yield_from!(self.close_two_file_descriptors(base_regset, pipe_read_end_in_child, pipe_write_end_in_child)));
+
+        ptrace::write(self.tracee.pid, stack_pointer as *mut libc::c_void, original_sp_value).expect("todo restoring at sp");
 
         co_return!(Ok(()));
     }

@@ -18,7 +18,8 @@ all:
 
 .PHONY: build
 build:
-	@$(ORB) cargo build --target $(TARGET)
+	@# silence dead_code and unused_imports cause they get annoying when developing
+	@$(ORB) env RUSTFLAGS='-A dead_code -A unused_imports' cargo build --target $(TARGET)
 
 .PHONY: cargo-tests
 cargo-tests:

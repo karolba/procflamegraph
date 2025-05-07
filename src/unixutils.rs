@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd, FromRawFd, AsRawFd};
 use std::path::Path;
 use libc::c_int;
 use nix::errno::Errno;
@@ -101,4 +101,22 @@ pub(crate) fn kernel_major_minor() -> Option<(u32, u32)> {
     let minor = str::parse::<u32>(&release[major_length+1..major_length+1+minor_length]).ok()?;
 
     Some((major, minor))
+}
+
+// missing from both libc and the nix crate
+pub(crate) fn pidfd_open(pid: libc::pid_t, flags: libc::c_uint) -> nix::Result<OwnedFd> {
+    Errno::result(unsafe { 
+        libc::syscall(libc::SYS_pidfd_open, pid, flags)
+    }).map(|fd| unsafe {
+        OwnedFd::from_raw_fd(fd as RawFd)
+    })
+}
+
+// missing from both libc and the nix crate
+pub(crate) fn pidfd_getfd(pidfd: BorrowedFd, targetfd: libc::c_int, flags: libc::c_uint) -> nix::Result<OwnedFd> {
+    Errno::result(unsafe {
+        libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd() as libc::c_int, targetfd, flags)
+    }).map(|fd| unsafe {
+        OwnedFd::from_raw_fd(fd as RawFd)
+    })
 }
