@@ -10,6 +10,7 @@ pub(crate) struct Args {
     pub(crate) display_threads: bool,
     pub(crate) test_always_detach: bool,
     pub(crate) capture_stderr: bool,
+    pub(crate) reexec_ptraceme: bool,
 }
 
 impl Args {
@@ -23,6 +24,7 @@ impl Args {
             display_threads: false,
             test_always_detach: false,
             capture_stderr: false,
+            reexec_ptraceme: false,
         }
     }
 }
@@ -62,15 +64,14 @@ pub(crate) fn parse_args() -> Args {
 
     while let Some(arg) = parser.next().unwrap_or_else(|err| argument_parsing_error_usage(&args.our_name, &*err.to_string())) {
         match arg {
-            Short('p') | Long("pids")   => args.display_pids = true,
-            Long("no-pids")             => args.display_pids = false,
-            Short('t') | Long("times")  => args.display_times = true,
-            Long("no-times")            => args.display_times = false,
-            Long("show-threads")        => args.display_threads = true,
-            Long("no-show-threads")     => args.display_threads = false,
-            Long("capture-stderr")      => args.capture_stderr = true,
-            Long("no-capture-stderr")   => args.capture_stderr = false,
-            Long("_test-always-detach") => args.test_always_detach = true,
+            Short('p') | Long("pids")  => args.display_pids = true,
+            Long("no-pids")            => args.display_pids = false,
+            Short('t') | Long("times") => args.display_times = true,
+            Long("no-times")           => args.display_times = false,
+            Long("show-threads")       => args.display_threads = true,
+            Long("no-show-threads")    => args.display_threads = false,
+            Long("capture-stderr")     => args.capture_stderr = true,
+            Long("no-capture-stderr")  => args.capture_stderr = false,
             Short('h') | Long("help") => {
                 usage(&args.our_name);
                 std::process::exit(0);
@@ -78,6 +79,11 @@ pub(crate) fn parse_args() -> Args {
             Short('o') | Long("output") => {
                 args.output_file = Some(parser.value().unwrap_or_else(|err| argument_parsing_error_usage(&args.our_name, &*err.to_string())));
             }
+
+            // hidden flags
+            Long("_test-always-detach") => args.test_always_detach = true,
+            Long("_reexec-ptraceme")    => args.reexec_ptraceme = true,
+
             Value(command) => {
                 args.command = vec![command];
                 parser

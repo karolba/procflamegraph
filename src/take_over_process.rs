@@ -8,6 +8,8 @@ use crate::coroutines::{CoroutineState, co_return, co_try, co_yield, co_yield_fr
 use crate::ptrace_syscall_info::{SyscallEntry, SyscallExit, SyscallOp};
 use crate::tracee::{ArgvEnvpAddrs, PokeResult, Tracee};
 use crate::unixutils;
+use crate::output_peeker;
+use crate::output_peeker::OutputPeeker;
 
 use nix::sys::ptrace;
 
@@ -76,6 +78,7 @@ fn roll_instruction_pointer_back_over_syscall_instruction(mut regs: libc::user_r
 pub(crate) struct TakeOverActions<'a> {
     pub(crate) tracee: Tracee,
     pub(crate) procfs: BorrowedFd<'a>,
+    pub(crate) output_peeker: &'a OutputPeeker,
     pub(crate) do_redirect_stderr: bool,
     pub(crate) do_reexec: bool,
 }
@@ -228,6 +231,12 @@ impl TakeOverActions<'_> {
         co_try!(co_yield_from!(self.close_two_file_descriptors(base_regset, pipe_read_end_in_child, pipe_write_end_in_child)));
 
         ptrace::write(self.tracee.pid, stack_pointer as *mut libc::c_void, original_sp_value).expect("todo restoring at sp");
+
+        self.output_peeker.send(output_peeker::NewChild{
+            pid: self.tracee.pid,
+            original_stderr: childs_original_stderr,
+            pipe_from_child: read_pipe,
+        });
 
         co_return!(Ok(()));
     }

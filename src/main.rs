@@ -16,6 +16,7 @@ mod take_over_process;
 mod tracee;
 mod tracer;
 mod unixutils;
+mod output_peeker;
 
 use std::{
     collections::HashMap,
@@ -30,7 +31,7 @@ use std::{
 // use std::ffi::OsStr;
 use nix::sys::signal::Signal;
 
-static ARGS : OnceLock<args::Args> = OnceLock::new();
+static ARGS: OnceLock<args::Args> = OnceLock::new();
 pub(crate) fn args() -> &'static args::Args {
     ARGS.get().unwrap()
 }
@@ -117,18 +118,45 @@ impl Process {
     }
 }
 
-fn run_child(command: Vec<OsString>) -> ! {
+#[derive(PartialEq)]
+enum ExecTracedChildOptions {
+    TryToReexecOnPtracemeEPERM,
+    DoNotTryToReexecOnPtracemeEPERM,
+}
+fn exec_traced_child(opts: ExecTracedChildOptions) -> ! {
     use std::os::unix::ffi::OsStrExt;
+    let child_args: Vec<CString> = args().command.iter().map(|osstr| CString::new(osstr.as_bytes()).unwrap()).collect();
 
-    nix::sys::ptrace::traceme().expect("call to ptrace(PTRACE_TRACEME) failed");
+    match nix::sys::ptrace::traceme() {
+        Err(nix::errno::Errno::EPERM) if opts == ExecTracedChildOptions::TryToReexecOnPtracemeEPERM => {
+            // we might be being ptraced ourselves
+            // to support running under `strace -f -b execve` let's reexec ourselves and the do the PTRACE_TRACEME then
+
+            let reexec_args = [
+                vec![
+                    CString::new(args().our_name.clone()).unwrap(),
+                    c"--_reexec-ptraceme".into(),
+                    c"--".into(),
+                ],
+                child_args.clone()
+            ].concat();
+
+            nix::unistd::execvp(c"/proc/self/exe", &reexec_args).expect("couldn't reexec myself");
+
+            unreachable!();
+        }
+        result => {
+            // todo: don't error out here, just maybe warn, give up, and continue without tracing
+            result.expect("call to ptrace(PTRACE_TRACEME) failed");
+        }
+    }
 
     // Stop ourselves so our tracer parent can set up PTRACE_SETOPTIONS on us
     nix::sys::signal::raise(Signal::SIGSTOP).expect("raise(SIGSTOP) failed");
 
-    let args: Vec<CString> = command.iter().map(|osstr| CString::new(osstr.as_bytes()).unwrap()).collect();
     // todo: better errors if execve fails
     //       and return with -127 then
-    nix::unistd::execvp(args.get(0).expect("need to pass at least one arg"), &args).expect("execve failed");
+    nix::unistd::execvp(child_args.get(0).expect("need to pass at least one arg"), &child_args).expect("execve failed");
 
     unreachable!();
 }
@@ -240,6 +268,10 @@ fn main() -> std::process::ExitCode {
 
     ARGS.set(args::parse_args()).ok();
 
+    if args().reexec_ptraceme {
+        exec_traced_child(ExecTracedChildOptions::DoNotTryToReexecOnPtracemeEPERM);
+    }
+
     warn_on_an_old_kernel();
 
     // do this before setting up signal handlers to not have to worry about EINTR
@@ -249,10 +281,13 @@ fn main() -> std::process::ExitCode {
             .unwrap_or_else(|err| error_out!("Can't access /proc: {}", err));
 
     // safety: can only fork like that at the beginning when no other threads are yet running
-    let child_pid = run_in_fork(|| run_child(args().command.clone()));
+    let child_pid = run_in_fork(|| exec_traced_child(ExecTracedChildOptions::TryToReexecOnPtracemeEPERM));
+
+    // can finally create threads
+    let output_peeker = output_peeker::OutputPeeker::new();
 
     setup_termination_signal_handler();
-    let events = tracer::waitpid_loop(child_pid, proc_dir_fd.as_fd());
+    let events = tracer::waitpid_loop(child_pid, proc_dir_fd.as_fd(), &output_peeker);
     // if we've got here we'll exit shortly anyway so ignore SIGTERM and SIGINT instead of using SigDfl
     ignore_termination_signals();
 

@@ -1,4 +1,14 @@
-use crate::{TERMINATION_SIGNAL_CAUGHT, coroutines::CoroutineState, take_over_process, tracee::Tracee, unixutils, args, errors::log_warn};
+use crate::{
+    TERMINATION_SIGNAL_CAUGHT,
+    coroutines::CoroutineState,
+    take_over_process,
+    tracee::Tracee,
+    unixutils,
+    args,
+    errors::log_warn,
+    output_peeker::OutputPeeker
+};
+
 use WaitResult::{GotTerminationSignal, Result, WaitpidErr};
 use nix::{
     fcntl::AtFlags,
@@ -9,8 +19,8 @@ use std::{
     os::fd::BorrowedFd,
     path::PathBuf,
     sync::atomic::Ordering,
+    mem::MaybeUninit,
 };
-use std::mem::MaybeUninit;
 
 #[derive(Debug)]
 pub(crate) enum Event {
@@ -94,7 +104,7 @@ fn is_special_secure_exe_screwed(pid: nix::unistd::Pid, procfs_fd: BorrowedFd) -
     }
 }
 
-pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, procfs_fd: BorrowedFd) -> Vec<Event> {
+pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, procfs_fd: BorrowedFd, output_peeker: &OutputPeeker) -> Vec<Event> {
     use libc::{PTRACE_EVENT_CLONE, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK};
     use nix::{
         sys::signal::Signal::{SIGKILL, SIGSTOP, SIGTRAP},
@@ -152,6 +162,7 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, procfs_fd: BorrowedFd
                 let take_over_actions = take_over_process::TakeOverActions{
                     tracee: Tracee::from(child),
                     procfs: procfs_fd,
+                    output_peeker: output_peeker,
                     do_redirect_stderr: args().capture_stderr,
                     do_reexec: is_special_secure_exe_screwed(child, procfs_fd),
                 };
