@@ -1,11 +1,7 @@
-use crate::{
-    ptrace_syscall_info::{SyscallEntry, SyscallInfo, ptrace_get_syscall_info},
-    unixutils,
-};
+use crate::{ptrace_syscall_info::{SyscallEntry, SyscallInfo, ptrace_get_syscall_info}, sys_linux};
 
 use std::{
-    os::fd::{BorrowedFd, OwnedFd},
-    path::PathBuf,
+    os::fd::{OwnedFd},
 };
 
 #[derive(Clone, Copy)]
@@ -124,11 +120,10 @@ impl Tracee {
         Ok(())
     }
 
-    pub(crate) fn argv_envp_addrs(self, procfs: BorrowedFd) -> Result<(Option<ArgvEnvpAddrs>, OwnedFd), std::io::Error> {
+    pub(crate) fn argv_envp_addrs(self) -> Result<(Option<ArgvEnvpAddrs>, OwnedFd), std::io::Error> {
         use bstr::ByteSlice;
 
-        let path = PathBuf::from(self.pid.to_string()).join("stat");
-        let (bytes, fd) = unixutils::read_restart_on_eintr_delay_close(procfs, path.as_path())?;
+        let (bytes, fd) = sys_linux::process_stat(self.pid)?;
 
         let after_rparen_idx: usize = match bytes.rfind_byte(b')') {
             Some(x) => x + 2,

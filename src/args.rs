@@ -30,10 +30,15 @@ impl Args {
 }
 
 
-fn usage(application_name: &str) {
+fn usage(application_name: &str, err: Option<&str>) {
     // eprintln!() is not buffered at all by default
     let mut b = std::io::BufWriter::new(std::io::stderr());
 
+    if let Some(err_text) = err {
+        let _ = writeln!(b, "{application_name}: {err_text}");
+        let _ = writeln!(b, "");
+    }
+    
     let _ = writeln!(b, "Usage: {application_name} [-pt] [-o file] [--] command [arg...]");
     let _ = writeln!(b, "       {application_name} [-h|--help]");
     let _ = writeln!(b, "Options:");
@@ -50,8 +55,7 @@ fn usage(application_name: &str) {
 }
 
 fn argument_parsing_error_usage(application_name: &str, err: &str) -> ! {
-    eprintln!("{application_name}: {err}\n");
-    usage(application_name);
+    usage(application_name, Some(err));
     std::process::exit(1);
 }
 
@@ -73,7 +77,7 @@ pub(crate) fn parse_args() -> Args {
             Long("capture-stderr")     => args.capture_stderr = true,
             Long("no-capture-stderr")  => args.capture_stderr = false,
             Short('h') | Long("help") => {
-                usage(&args.our_name);
+                usage(&args.our_name, None);
                 std::process::exit(0);
             }
             Short('o') | Long("output") => {
@@ -97,7 +101,7 @@ pub(crate) fn parse_args() -> Args {
     }
 
     if args.command.is_empty() {
-        usage(&args.our_name);
+        usage(&args.our_name, None);
         std::process::exit(1);
     }
 

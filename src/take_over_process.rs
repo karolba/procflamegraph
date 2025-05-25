@@ -1,15 +1,15 @@
 // Use `gen` blocks as crude coroutines
 
 use std::os::fd::{AsFd, OwnedFd, BorrowedFd};
-use std::path::PathBuf;
-use std::error::Error;
 
-use crate::coroutines::{CoroutineState, co_return, co_try, co_yield, co_yield_from};
-use crate::ptrace_syscall_info::{SyscallEntry, SyscallExit, SyscallOp};
-use crate::tracee::{ArgvEnvpAddrs, PokeResult, Tracee};
-use crate::unixutils;
-use crate::output_peeker;
-use crate::output_peeker::OutputPeeker;
+use crate::{
+    output_peeker,
+    sys_linux,
+    tracee::{ArgvEnvpAddrs, PokeResult, Tracee},
+    ptrace_syscall_info::{SyscallEntry, SyscallExit, SyscallOp},
+    coroutines::{CoroutineState, co_return, co_try, co_yield, co_yield_from},
+    output_peeker::OutputPeeker
+};
 
 use nix::sys::ptrace;
 
@@ -77,7 +77,6 @@ fn roll_instruction_pointer_back_over_syscall_instruction(mut regs: libc::user_r
 #[derive(Clone, Copy)]
 pub(crate) struct TakeOverActions<'a> {
     pub(crate) tracee: Tracee,
-    pub(crate) procfs: BorrowedFd<'a>,
     pub(crate) output_peeker: &'a OutputPeeker,
     pub(crate) do_redirect_stderr: bool,
     pub(crate) do_reexec: bool,
@@ -183,12 +182,16 @@ impl TakeOverActions<'_> {
         // todo: don't panic if the child doesn't have stderr or stdout fds
         // this could legitimately happen
 
-        let procfd = unixutils::pidfd_open(self.tracee.pid.as_raw(), 0).expect("todo");
+        let pidfd = sys_linux::pidfd_open(self.tracee.pid.as_raw(), 0).expect("todo");
 
-        let childs_original_stderr = unixutils::pidfd_getfd(procfd.as_fd(), libc::STDERR_FILENO, 0).expect("todo");
+        let childs_original_stderr = sys_linux::pidfd_getfd(pidfd.as_fd(), libc::STDERR_FILENO, 0).expect("todo");
 
         // use the top of the stack as a temporary storage for the result of pipe2(2)
+        #[cfg(target_arch = "aarch64")]
         let stack_pointer = base_regset.sp;
+        #[cfg(target_arch = "x86_64")]
+        let stack_pointer = base_regset.rsp;
+
         let original_sp_value = ptrace::read(self.tracee.pid, stack_pointer as *mut libc::c_void).expect("todo read at sp");
 
         let duped: SyscallExit = co_yield_from!(syscall(self.tracee, base_regset, SyscallEntry {
@@ -211,7 +214,7 @@ impl TakeOverActions<'_> {
             .map(|word: i64| unsafe { std::mem::transmute::<i64, [i32; 2]>(word) })
             .expect("todo read at sp");
 
-        let read_pipe: OwnedFd = unixutils::pidfd_getfd(procfd.as_fd(), pipe_read_end_in_child, 0).expect("todo");
+        let read_pipe: OwnedFd = sys_linux::pidfd_getfd(pidfd.as_fd(), pipe_read_end_in_child, 0).expect("todo");
 
         let duped: SyscallExit = co_yield_from!(syscall(self.tracee, base_regset, SyscallEntry {
             nr: libc::SYS_dup3 as u64,
@@ -244,7 +247,7 @@ impl TakeOverActions<'_> {
     gen fn reexec(self, base_regset: libc::user_regs_struct) -> CoroutineState<(), Result<(), TakeOverError>> {
         use bstr::io::BufReadExt;
 
-        let addrs = match self.tracee.argv_envp_addrs(self.procfs) {
+        let addrs = match self.tracee.argv_envp_addrs() {
             Ok((
                 Some(ArgvEnvpAddrs {
                     argv_start: 0,
@@ -280,9 +283,9 @@ impl TakeOverActions<'_> {
         memory_to_inject.push(u64::from_ne_bytes(*b"lf/exe\0\0"));
 
         let argv_array_offset: u64 = memory_to_inject.len() as u64 * machine_word_size;
-        let path = PathBuf::from(self.tracee.pid.to_string()).join("cmdline");
         // todo: should this be a read_restart_on_eintr_delay_close?
-        let argv = match unixutils::read_restart_on_eintr(self.procfs, path.as_path()) {
+        // todo: we already have the cmdline (and envp?) of the process read from before
+        let (argv, _fd) = match sys_linux::process_cmdline(self.tracee.pid) {
             Err(e) => {
                 eprintln!("Warning: Could not read /proc/{}/cmdline: {}", self.tracee.pid, e);
                 co_return!(Err(TakeOverError::SomethingHappenedTodo()));
@@ -298,9 +301,8 @@ impl TakeOverActions<'_> {
         memory_to_inject.push(0u64); // null pointer at the end of argv
 
         let envp_array_offset: u64 = memory_to_inject.len() as u64 * machine_word_size;
-        let path = PathBuf::from(self.tracee.pid.to_string()).join("environ");
         // todo: should this be a read_restart_on_eintr_delay_close?
-        let envp = match unixutils::read_restart_on_eintr(self.procfs, path.as_path()) {
+        let (envp, _fd) = match sys_linux::process_environ(self.tracee.pid) {
             Err(e) => {
                 eprintln!("Warning: Could not read /proc/{}/environ: {}", self.tracee.pid, e);
                 co_return!(Err(TakeOverError::SomethingHappenedTodo()));

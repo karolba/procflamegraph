@@ -1,13 +1,4 @@
-use crate::{
-    TERMINATION_SIGNAL_CAUGHT,
-    coroutines::CoroutineState,
-    take_over_process,
-    tracee::Tracee,
-    unixutils,
-    args,
-    errors::log_warn,
-    output_peeker::OutputPeeker
-};
+use crate::{TERMINATION_SIGNAL_CAUGHT, coroutines::CoroutineState, take_over_process, tracee::Tracee, args, errors::log_warn, output_peeker::OutputPeeker, sys_linux::is_fd_a_pipe, sys_linux};
 
 use WaitResult::{GotTerminationSignal, Result, WaitpidErr};
 use nix::{
@@ -17,10 +8,10 @@ use nix::{
 use std::{
     collections::{HashMap, HashSet},
     os::fd::BorrowedFd,
-    path::PathBuf,
     sync::atomic::Ordering,
     mem::MaybeUninit,
 };
+use crate::sys_linux::stat_process_exe;
 
 #[derive(Debug)]
 pub(crate) enum Event {
@@ -73,7 +64,7 @@ fn waitpid_or_signal(rusage: &mut libc::rusage) -> WaitResult {
          */
 
         // use __WALL to wait for all child threads, not only thread group leaders ("processes")
-        match unixutils::wait4(None, Some(nix::sys::wait::WaitPidFlag::__WALL), rusage) {
+        match sys_linux::wait4(None, Some(nix::sys::wait::WaitPidFlag::__WALL), rusage) {
             Ok(result) => return Result(result),
             Err(nix::errno::Errno::EINTR) => {}
             Err(err) => return WaitpidErr(err),
@@ -81,12 +72,10 @@ fn waitpid_or_signal(rusage: &mut libc::rusage) -> WaitResult {
     }
 }
 
-fn is_special_secure_exe_screwed(pid: nix::unistd::Pid, procfs_fd: BorrowedFd) -> bool {
+fn is_special_secure_exe_screwed(pid: nix::unistd::Pid) -> bool {
     if args().test_always_detach {
         return true
     }
-
-    let proc_dir = PathBuf::from(pid.to_string());
 
     // todo: - file capabilities
     //       - check the linux kernel source code - what else can enable AT_SECURE?
@@ -94,7 +83,7 @@ fn is_special_secure_exe_screwed(pid: nix::unistd::Pid, procfs_fd: BorrowedFd) -
     //         (or disable PTRACE_MODE_FSCREDS?? although that should be a separate thing??)
 
     // fstatat can't fail with EINTR so it doesn't have to be restarted
-    match fstatat(procfs_fd, &proc_dir.join("exe"), AtFlags::empty()) {
+    match stat_process_exe(pid) {
         Ok(res) => {
             // todo - check gid (only if execute bit is set, mandatory file locking)
             //      - check if we aren't the same user/group (so no secure mode anyway)
@@ -104,7 +93,7 @@ fn is_special_secure_exe_screwed(pid: nix::unistd::Pid, procfs_fd: BorrowedFd) -
     }
 }
 
-pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, procfs_fd: BorrowedFd, output_peeker: &OutputPeeker) -> Vec<Event> {
+pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &OutputPeeker) -> Vec<Event> {
     use libc::{PTRACE_EVENT_CLONE, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK};
     use nix::{
         sys::signal::Signal::{SIGKILL, SIGSTOP, SIGTRAP},
@@ -150,21 +139,18 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, procfs_fd: BorrowedFd
             Result(PtraceEvent(child, SIGTRAP, PTRACE_EVENT_EXEC)) => {
                 let former_thread_id = ptrace::getevent(child).unwrap_or(-1);
 
-                let child_proc_dir = PathBuf::from(child.to_string());
-
                 // keep the _fd to close it at the end of the block, after ptrace::cont or
                 // ptrace::syscall (to get to resuming the process execution just a tiny bit faster)
-                let (cmdline, _fd) = match unixutils::read_restart_on_eintr_delay_close(procfs_fd, &child_proc_dir.join("cmdline")) {
+                let (cmdline, _fd) = match sys_linux::process_cmdline(child) {
                     Ok((cmdline, fd)) => (cmdline, Some(fd)),
                     Err(_) => (vec![b'?'], None), // ignore errors - the process could have just died.
                 };
 
                 let take_over_actions = take_over_process::TakeOverActions{
                     tracee: Tracee::from(child),
-                    procfs: procfs_fd,
                     output_peeker: output_peeker,
-                    do_redirect_stderr: args().capture_stderr,
-                    do_reexec: is_special_secure_exe_screwed(child, procfs_fd),
+                    do_redirect_stderr: args().capture_stderr && is_fd_a_pipe(child, libc::STDERR_FILENO),
+                    do_reexec: is_special_secure_exe_screwed(child),
                 };
 
                 if take_over_actions.is_any_action_set() {
@@ -206,7 +192,7 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, procfs_fd: BorrowedFd
                     },
 
                     Some(CoroutineState::Complete(Err(_))) => {
-                        // something has failed, we cannot restart 
+                        // something has failed, we cannot restart
                         //
                         // be mindful - could this also just mean the child died mid our request?
                         // TODO: log the error

@@ -1,10 +1,7 @@
 #![feature(gen_blocks)]
+#![feature(maybe_uninit_slice)]
 
-// disable unused imports and dead code warnings from debug builds
-// I wish this was user-configurable, instead of having it in the code
-#![cfg_attr(debug_assertions, allow(dead_code, unused_imports))]
-
-// has macros, needs to go first
+// those have macros, need to go first
 mod errors;
 mod coroutines;
 use errors::{error_out,log_warn};
@@ -15,8 +12,8 @@ mod syscall_list;
 mod take_over_process;
 mod tracee;
 mod tracer;
-mod unixutils;
 mod output_peeker;
+mod sys_linux;
 
 use std::{
     collections::HashMap,
@@ -130,7 +127,7 @@ fn exec_traced_child(opts: ExecTracedChildOptions) -> ! {
     match nix::sys::ptrace::traceme() {
         Err(nix::errno::Errno::EPERM) if opts == ExecTracedChildOptions::TryToReexecOnPtracemeEPERM => {
             // we might be being ptraced ourselves
-            // to support running under `strace -f -b execve` let's reexec ourselves and the do the PTRACE_TRACEME then
+            // to support running under `strace -f -b execve` let's reexec ourselves and try doing PTRACE_TRACEME again then
 
             let reexec_args = [
                 vec![
@@ -247,7 +244,7 @@ fn ignore_termination_signals() {
 }
 
 fn warn_on_an_old_kernel() {
-    let (major, minor) = match unixutils::kernel_major_minor() {
+    let (major, minor) = match sys_linux::kernel_major_minor() {
         Some(version) => version,
         None => return, // if we couldn't get the kernel version for some reason, ignore it
     };
@@ -261,11 +258,6 @@ fn warn_on_an_old_kernel() {
 }
 
 fn main() -> std::process::ExitCode {
-    use nix::{
-        fcntl::OFlag,
-        sys::stat::Mode
-    };
-
     ARGS.set(args::parse_args()).ok();
 
     if args().reexec_ptraceme {
@@ -274,12 +266,6 @@ fn main() -> std::process::ExitCode {
 
     warn_on_an_old_kernel();
 
-    // do this before setting up signal handlers to not have to worry about EINTR
-    // and before run_in_fork to fail early
-    let proc_dir_fd =
-        nix::fcntl::openat(nix::fcntl::AT_FDCWD, "/proc", OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC, Mode::empty())
-            .unwrap_or_else(|err| error_out!("Can't access /proc: {}", err));
-
     // safety: can only fork like that at the beginning when no other threads are yet running
     let child_pid = run_in_fork(|| exec_traced_child(ExecTracedChildOptions::TryToReexecOnPtracemeEPERM));
 
@@ -287,9 +273,11 @@ fn main() -> std::process::ExitCode {
     let output_peeker = output_peeker::OutputPeeker::new();
 
     setup_termination_signal_handler();
-    let events = tracer::waitpid_loop(child_pid, proc_dir_fd.as_fd(), &output_peeker);
+    let events = tracer::waitpid_loop(child_pid, &output_peeker);
     // if we've got here we'll exit shortly anyway so ignore SIGTERM and SIGINT instead of using SigDfl
     ignore_termination_signals();
+
+    output_peeker.finish();
 
     let processes = events_to_process_tree(events);
     let root = processes.get(&child_pid).expect("Our only child is not in children (??)");
@@ -305,8 +293,10 @@ fn main() -> std::process::ExitCode {
         .unwrap_or_else(|e| {
             let default_output_name = OsString::from("(stdout)");
             let filename = args().output_file.as_ref().unwrap_or(&default_output_name);
-            error_out!("Couldn't write process tree to file {}: {}", filename.to_string_lossy(), e);
+            error_out!("Couldn't write the process tree to file {}: {}", filename.to_string_lossy(), e);
         });
+
+    dbg!(output_peeker.result());
 
     let exit_code = std::process::ExitCode::from(match root.exit {
         None => 1,
@@ -314,9 +304,7 @@ fn main() -> std::process::ExitCode {
         Some(ExitReason::KilledBySignal {signal, ..}) => (128 + (signal as i32)) as u8
     });
 
-    // little tiny optimisation: don't close() the handle to /proc, we are exiting anyway
-    std::mem::forget(proc_dir_fd);
-    // and don't spend time unmapping memory as well (this gets rid of 1 syscall)
+    // don't spend time unmapping memory here (this gets rid of 1 syscall)
     std::mem::forget(processes);
 
     exit_code
