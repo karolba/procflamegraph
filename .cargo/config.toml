@@ -3,7 +3,7 @@
 
 [unstable]
 # Make binary size lots smaller:
-build-std = ["std"]
+build-std = ["std", "panic_abort"]
 build-std-features = ["optimize_for_size"]
 
 [build]

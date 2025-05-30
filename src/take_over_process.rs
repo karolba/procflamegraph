@@ -1,22 +1,20 @@
-// Use `gen` blocks as crude coroutines
-
-use std::os::fd::{AsFd, OwnedFd, BorrowedFd};
-
-use crate::{
-    output_peeker,
-    sys_linux,
-    tracee::{ArgvEnvpAddrs, PokeResult, Tracee},
-    ptrace_syscall_info::{SyscallEntry, SyscallExit, SyscallOp},
-    coroutines::{CoroutineState, co_return, co_try, co_yield, co_yield_from},
-    output_peeker::OutputPeeker
-};
-
+use std::os::fd::{AsFd, OwnedFd};
 use nix::sys::ptrace;
-
+use crate::{
+    sys_linux::ptrace::{ArgvEnvpAddrs, PokeResult, Tracee},
+    sys_linux::proc::{process_cmdline, process_environ},
+    sys_linux::fd::{pidfd_getfd, pidfd_open},
+    coroutines::{co_return, co_try, co_yield, co_yield_from, CoroutineState},
+    output_peeker,
+    output_peeker::OutputPeeker,
+    sys_linux::ptrace_syscall_info::{SyscallEntry, SyscallExit, SyscallOp}
+};
 
 // todo: change this wait_* stuff for `next_syscall`
 // or `do_syscall`
 // it should
+
+// Use `gen` blocks as crude coroutines
 
 gen fn wait_for_syscall_entry(tracee: Tracee) -> CoroutineState<(), nix::Result<SyscallEntry>> {
     loop {
@@ -124,7 +122,7 @@ impl TakeOverActions<'_> {
 
     gen fn close_two_file_descriptors(self, base_regset: libc::user_regs_struct, fd1: i32, fd2: i32) -> CoroutineState<(), Result<(), TakeOverError>> {
         if fd1 + 1 == fd2 || fd1 - 1 == fd2 /* TODO: AND ON LINUX 5.9 AT LEAST! */ {
-            // todo: close on linux always cleans the file dsecriptor (even if we get an EINTR),
+            // todo: close on linux always cleans the file descriptor (even if we get an EINTR),
             // only EBADF is a real bad error
             let res: SyscallExit = co_yield_from!(syscall(self.tracee, base_regset, SyscallEntry {
                 nr: libc::SYS_close_range as u64,
@@ -141,7 +139,7 @@ impl TakeOverActions<'_> {
                 todo!();
             }
         } else {
-            // todo: close on linux always cleans the file dsecriptor (even if we get an EINTR),
+            // todo: close on linux always cleans the file descriptor (even if we get an EINTR),
             // only EBADF is a real bad error
             let res: SyscallExit = co_yield_from!(syscall(self.tracee, base_regset, SyscallEntry {
                 nr: libc::SYS_close as u64,
@@ -182,9 +180,9 @@ impl TakeOverActions<'_> {
         // todo: don't panic if the child doesn't have stderr or stdout fds
         // this could legitimately happen
 
-        let pidfd = sys_linux::pidfd_open(self.tracee.pid.as_raw(), 0).expect("todo");
+        let pidfd = pidfd_open(self.tracee.pid.as_raw(), 0).expect("todo");
 
-        let childs_original_stderr = sys_linux::pidfd_getfd(pidfd.as_fd(), libc::STDERR_FILENO, 0).expect("todo");
+        let childs_original_stderr = pidfd_getfd(pidfd.as_fd(), libc::STDERR_FILENO, 0).expect("todo");
 
         // use the top of the stack as a temporary storage for the result of pipe2(2)
         #[cfg(target_arch = "aarch64")]
@@ -214,7 +212,7 @@ impl TakeOverActions<'_> {
             .map(|word: i64| unsafe { std::mem::transmute::<i64, [i32; 2]>(word) })
             .expect("todo read at sp");
 
-        let read_pipe: OwnedFd = sys_linux::pidfd_getfd(pidfd.as_fd(), pipe_read_end_in_child, 0).expect("todo");
+        let read_pipe: OwnedFd = pidfd_getfd(pidfd.as_fd(), pipe_read_end_in_child, 0).expect("todo");
 
         let duped: SyscallExit = co_yield_from!(syscall(self.tracee, base_regset, SyscallEntry {
             nr: libc::SYS_dup3 as u64,
@@ -235,7 +233,7 @@ impl TakeOverActions<'_> {
 
         ptrace::write(self.tracee.pid, stack_pointer as *mut libc::c_void, original_sp_value).expect("todo restoring at sp");
 
-        self.output_peeker.send(output_peeker::NewChild{
+        self.output_peeker.start_peeking_child(output_peeker::StartPeeking {
             pid: self.tracee.pid,
             original_stderr: childs_original_stderr,
             pipe_from_child: read_pipe,
@@ -285,7 +283,7 @@ impl TakeOverActions<'_> {
         let argv_array_offset: u64 = memory_to_inject.len() as u64 * machine_word_size;
         // todo: should this be a read_restart_on_eintr_delay_close?
         // todo: we already have the cmdline (and envp?) of the process read from before
-        let (argv, _fd) = match sys_linux::process_cmdline(self.tracee.pid) {
+        let (argv, _fd) = match process_cmdline(self.tracee.pid) {
             Err(e) => {
                 eprintln!("Warning: Could not read /proc/{}/cmdline: {}", self.tracee.pid, e);
                 co_return!(Err(TakeOverError::SomethingHappenedTodo()));
@@ -302,7 +300,7 @@ impl TakeOverActions<'_> {
 
         let envp_array_offset: u64 = memory_to_inject.len() as u64 * machine_word_size;
         // todo: should this be a read_restart_on_eintr_delay_close?
-        let (envp, _fd) = match sys_linux::process_environ(self.tracee.pid) {
+        let (envp, _fd) = match process_environ(self.tracee.pid) {
             Err(e) => {
                 eprintln!("Warning: Could not read /proc/{}/environ: {}", self.tracee.pid, e);
                 co_return!(Err(TakeOverError::SomethingHappenedTodo()));

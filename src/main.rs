@@ -1,32 +1,33 @@
 #![feature(gen_blocks)]
 #![feature(maybe_uninit_slice)]
-
-// those have macros, need to go first
-mod errors;
-mod coroutines;
-use errors::{error_out,log_warn};
+#![feature(let_chains)]
 
 mod args;
-mod ptrace_syscall_info;
-mod syscall_list;
-mod take_over_process;
-mod tracee;
-mod tracer;
+mod coroutines;
+mod errors;
 mod output_peeker;
 mod sys_linux;
+mod take_over_process;
+mod tracer;
+mod output;
 
-use std::{
-    collections::HashMap,
-    ffi::{CString, OsString},
-    fs::File,
-    io::{BufWriter, Write},
-    os::fd::AsFd,
-    sync::OnceLock,
-    sync::atomic::{AtomicBool, Ordering},
-    time::SystemTime,
+use crate::{
+    errors::log_warn,
+    output::output_process_tree,
+    sys_linux::kernel_version::kernel_major_minor,
 };
-// use std::ffi::OsStr;
-use nix::sys::signal::Signal;
+use nix::{
+    sys::{ptrace, signal::Signal},
+    unistd::{fork, ForkResult},
+};
+use std::{
+    ffi::CString,
+    io::Write,
+    os::fd::AsFd,
+    process::ExitCode,
+    sync::atomic::{AtomicBool, Ordering},
+    sync::OnceLock,
+};
 
 static ARGS: OnceLock<args::Args> = OnceLock::new();
 pub(crate) fn args() -> &'static args::Args {
@@ -47,73 +48,13 @@ pub(crate) fn args() -> &'static args::Args {
 
 static TERMINATION_SIGNAL_CAUGHT: AtomicBool = AtomicBool::new(false);
 
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ExitReason {
     NormalExit { exit_code: i64 },
     // todo: is there a signal type in the nix crate?
     KilledBySignal { signal: Signal, generated_core_dump: bool },
 }
 
-#[derive(Debug)]
-struct Process {
-    pid: nix::unistd::Pid,
-    children: Vec<nix::unistd::Pid>,
-    execvs: Vec<Vec<String>>,
-    exit: Option<ExitReason>,
-    #[allow(dead_code)] start_time: Option<SystemTime>,
-    #[allow(dead_code)] stop_time: Option<SystemTime>, // todo: use those?
-}
-
-impl Process {
-    fn new(pid: nix::unistd::Pid) -> Process {
-        Process {
-            pid,
-            children: vec![],
-            execvs: vec![],
-            exit: None,
-            start_time: None,
-            stop_time: None,
-        }
-    }
-
-    fn print_tree(&self, indent: usize, others: &HashMap<nix::unistd::Pid, Process>, out: &mut dyn Write) -> Result<(), std::io::Error> {
-        if !args().display_threads && self.execvs.is_empty() && matches!(self.exit, Some(ExitReason::NormalExit{ exit_code: 0 })) {
-            // collapse worker threads that didn't contribute anything and only muddy out the output
-            // todo maybe add an option to disable this behaviour (select a cool name first tho)
-            for child in self.children.iter() {
-                if let Some(child_process) = others.get(child) {
-                    child_process.print_tree(indent, others, out)?;
-                }
-            }
-        } else {
-            write!(out, "{:indent$}- ", "")?;
-            if args().display_pids {
-                write!(out, "({}) ", self.pid)?;
-            }
-            for execv in self.execvs.iter() {
-                write!(out, "{execv:?} -> ")?;
-            }
-            if self.execvs.len() == 0 {
-                write!(out, "-> ")?;
-            }
-            match self.exit {
-                Some(ExitReason::NormalExit { exit_code }) => writeln!(out, "{}", exit_code)?,
-                Some(ExitReason::KilledBySignal { signal, generated_core_dump: true }) => writeln!(out, "killed by {} (core dumped)", signal.as_str())?,
-                Some(ExitReason::KilledBySignal { signal, generated_core_dump: false }) => writeln!(out, "killed by {}", signal.as_str())?,
-                None => writeln!(out, "(unknown)")?,
-            };
-
-            for child in self.children.iter() {
-                if let Some(child_process) = others.get(child) {
-                    child_process.print_tree(indent + 2, others, out)?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
 
 #[derive(PartialEq)]
 enum ExecTracedChildOptions {
@@ -124,7 +65,7 @@ fn exec_traced_child(opts: ExecTracedChildOptions) -> ! {
     use std::os::unix::ffi::OsStrExt;
     let child_args: Vec<CString> = args().command.iter().map(|osstr| CString::new(osstr.as_bytes()).unwrap()).collect();
 
-    match nix::sys::ptrace::traceme() {
+    match ptrace::traceme() {
         Err(nix::errno::Errno::EPERM) if opts == ExecTracedChildOptions::TryToReexecOnPtracemeEPERM => {
             // we might be being ptraced ourselves
             // to support running under `strace -f -b execve` let's reexec ourselves and try doing PTRACE_TRACEME again then
@@ -139,7 +80,6 @@ fn exec_traced_child(opts: ExecTracedChildOptions) -> ! {
             ].concat();
 
             nix::unistd::execvp(c"/proc/self/exe", &reexec_args).expect("couldn't reexec myself");
-
             unreachable!();
         }
         result => {
@@ -154,56 +94,18 @@ fn exec_traced_child(opts: ExecTracedChildOptions) -> ! {
     // todo: better errors if execve fails
     //       and return with -127 then
     nix::unistd::execvp(child_args.get(0).expect("need to pass at least one arg"), &child_args).expect("execve failed");
-
     unreachable!();
 }
 
 fn run_in_fork<F: FnOnce() -> ()>(run_child: F) -> nix::unistd::Pid {
     // safety: can really only call this function when no more than 1 thread is yet to run
-    match unsafe { nix::unistd::fork() }.expect("fork() failed") {
-        nix::unistd::ForkResult::Parent { child } => child,
-        nix::unistd::ForkResult::Child => {
+    match unsafe { fork() }.expect("fork() failed") {
+        ForkResult::Parent { child } => child,
+        ForkResult::Child => {
             run_child();
             std::process::exit(1);
         }
     }
-}
-
-fn events_to_process_tree(events: Vec<tracer::Event>) -> HashMap<nix::unistd::Pid, Process> {
-    use crate::tracer::Event;
-
-    let mut processes: HashMap<nix::unistd::Pid, Process> = HashMap::new();
-
-    for event in events {
-        match event {
-            Event::NewChild { child, parent } => {
-                let parent = processes.entry(parent).or_insert_with(|| Process::new(parent));
-                parent.children.push(child);
-                processes.entry(child).or_insert_with(|| Process::new(child));
-            }
-            Event::KilledBySignal { pid, signal, generated_core_dump, rusage: _rusage } => {
-                let process = processes.entry(pid).or_insert_with(|| Process::new(pid));
-                process.exit = Some(ExitReason::KilledBySignal{ signal, generated_core_dump });
-            }
-            Event::NormalExit { pid, exit_code, rusage: _rusage } => {
-                let process = processes.entry(pid).or_insert_with(|| Process::new(pid));
-                process.exit = Some(ExitReason::NormalExit{ exit_code });
-            }
-            Event::Exec { pid, args, _former_thread_id, rusage: _rusage } => {
-                // todo: former_thread_id, should I do anything with it? doesn't seem like I should?
-                let mut args: Vec<String> = args.split(|x| *x == 0u8).map(|arg| String::from_utf8_lossy(arg).to_string()).collect();
-                if let Some(last) = args.last() {
-                    if last.is_empty() {
-                        args.pop(); // get rid of the last entry (we split by '\0' but it's really '\0'-ended chunks)
-                    }
-                };
-                let process = processes.entry(pid).or_insert_with(|| Process::new(pid));
-                process.execvs.push(args);
-            }
-        }
-    }
-
-    processes
 }
 
 extern "C" fn sigaction_handler(_signal: libc::c_int) {
@@ -244,7 +146,7 @@ fn ignore_termination_signals() {
 }
 
 fn warn_on_an_old_kernel() {
-    let (major, minor) = match sys_linux::kernel_major_minor() {
+    let (major, minor) = match kernel_major_minor() {
         Some(version) => version,
         None => return, // if we couldn't get the kernel version for some reason, ignore it
     };
@@ -257,7 +159,8 @@ fn warn_on_an_old_kernel() {
     }
 }
 
-fn main() -> std::process::ExitCode {
+
+fn main() -> ExitCode {
     ARGS.set(args::parse_args()).ok();
 
     if args().reexec_ptraceme {
@@ -277,35 +180,14 @@ fn main() -> std::process::ExitCode {
     // if we've got here we'll exit shortly anyway so ignore SIGTERM and SIGINT instead of using SigDfl
     ignore_termination_signals();
 
-    output_peeker.finish();
+    // todo: output_peeker.result() waits on all pipes to close
+    //       this should probably be interruptable with SIGTERM/SIGINT
+    //       maybe we could even have a default timeout if a SIGTERM/SIGINT was received before?
+    let root_process_exit = output_process_tree(events, child_pid, output_peeker.result());
 
-    let processes = events_to_process_tree(events);
-    let root = processes.get(&child_pid).expect("Our only child is not in children (??)");
-    let mut output: Box<dyn Write> = match &args().output_file {
-        None => Box::new(BufWriter::new(std::io::stdout())),
-        Some(path) => Box::new(BufWriter::new(
-            File::create(&path).unwrap_or_else(|err| error_out!("Can't open file {} for writing: {}", path.to_string_lossy(), err)),
-        )),
-    };
-
-    root.print_tree(0, &processes, &mut output)
-        .and_then(|_| output.flush()) // We wouldn't get to catch write errors without flushing manually
-        .unwrap_or_else(|e| {
-            let default_output_name = OsString::from("(stdout)");
-            let filename = args().output_file.as_ref().unwrap_or(&default_output_name);
-            error_out!("Couldn't write the process tree to file {}: {}", filename.to_string_lossy(), e);
-        });
-
-    dbg!(output_peeker.result());
-
-    let exit_code = std::process::ExitCode::from(match root.exit {
+    ExitCode::from(match root_process_exit {
         None => 1,
         Some(ExitReason::NormalExit {exit_code}) => exit_code as u8,
         Some(ExitReason::KilledBySignal {signal, ..}) => (128 + (signal as i32)) as u8
-    });
-
-    // don't spend time unmapping memory here (this gets rid of 1 syscall)
-    std::mem::forget(processes);
-
-    exit_code
+    })
 }

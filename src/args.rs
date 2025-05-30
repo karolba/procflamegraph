@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::io::Write;
+use std::process::exit;
 
 pub(crate) struct Args {
     pub(crate) our_name: String,
@@ -11,6 +12,7 @@ pub(crate) struct Args {
     pub(crate) test_always_detach: bool,
     pub(crate) capture_stderr: bool,
     pub(crate) reexec_ptraceme: bool,
+    pub(crate) json_output: bool,
 }
 
 impl Args {
@@ -25,6 +27,7 @@ impl Args {
             test_always_detach: false,
             capture_stderr: false,
             reexec_ptraceme: false,
+            json_output: false,
         }
     }
 }
@@ -52,11 +55,7 @@ fn usage(application_name: &str, err: Option<&str>) {
     let _ = writeln!(b, "         --no-show-threads   - don't show threads alongside processes (default)");
     let _ = writeln!(b, "         --capture-stderr    - show stderr from all child processes");
     let _ = writeln!(b, "         --no-capture-stderr - don't show stderr from all child processes processes (default)");
-}
-
-fn argument_parsing_error_usage(application_name: &str, err: &str) -> ! {
-    usage(application_name, Some(err));
-    std::process::exit(1);
+    let _ = writeln!(b, " -j      --json              - output the process tree in JSON");
 }
 
 pub(crate) fn parse_args() -> Args {
@@ -66,7 +65,7 @@ pub(crate) fn parse_args() -> Args {
     let mut parser = lexopt::Parser::from_env();
     args.our_name = parser.bin_name().unwrap_or("procflamegraph").to_string();
 
-    while let Some(arg) = parser.next().unwrap_or_else(|err| argument_parsing_error_usage(&args.our_name, &*err.to_string())) {
+    while let Some(arg) = parser.next().unwrap_or_else(|err| { usage(&args.our_name, Some(&err.to_string())); exit(1) }) {
         match arg {
             Short('p') | Long("pids")  => args.display_pids = true,
             Long("no-pids")            => args.display_pids = false,
@@ -76,33 +75,40 @@ pub(crate) fn parse_args() -> Args {
             Long("no-show-threads")    => args.display_threads = false,
             Long("capture-stderr")     => args.capture_stderr = true,
             Long("no-capture-stderr")  => args.capture_stderr = false,
+            Short('j') | Long("json")  => args.json_output = true,
             Short('h') | Long("help") => {
                 usage(&args.our_name, None);
-                std::process::exit(0);
+                exit(0);
             }
             Short('o') | Long("output") => {
-                args.output_file = Some(parser.value().unwrap_or_else(|err| argument_parsing_error_usage(&args.our_name, &*err.to_string())));
+                args.output_file = Some(parser.value().unwrap_or_else(|err| { usage(&args.our_name, Some(&err.to_string())); exit(1) }));
             }
 
-            // hidden flags
-            Long("_test-always-detach") => args.test_always_detach = true,
-            Long("_reexec-ptraceme")    => args.reexec_ptraceme = true,
+            // hidden undocumented flags
+            Long("_test-always-detach") => args.test_always_detach = true, // used in tests
+            Long("_reexec-ptraceme")    => args.reexec_ptraceme = true,    // used when reexecing ourselves
 
             Value(command) => {
                 args.command = vec![command];
                 parser
                     .raw_args()
-                    .unwrap_or_else(|err| argument_parsing_error_usage(&args.our_name, &*err.to_string()))
+                    .unwrap_or_else(|err| { usage(&args.our_name, Some(&err.to_string())); exit(1) })
                     .for_each(|arg| args.command.push(arg));
             }
-            Short(x) => argument_parsing_error_usage(&args.our_name, &*format!("Unknown option \"-{x}\"")),
-            Long(x) => argument_parsing_error_usage(&args.our_name, &*format!("Unknown option \"--{x}\"")),
+            Short(x) => {
+                usage(&args.our_name, Some(&format!("Unknown option \"-{x}\"")));
+                exit(1);
+            }
+            Long(x) => {
+                usage(&args.our_name, Some(&format!("Unknown option \"--{x}\"")));
+                exit(1);
+            }
         }
     }
 
     if args.command.is_empty() {
         usage(&args.our_name, None);
-        std::process::exit(1);
+        exit(1);
     }
 
     args

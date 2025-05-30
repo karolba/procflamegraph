@@ -12,6 +12,7 @@ Options:
          --no-show-threads   - don't show threads alongside processes (default)
          --capture-stderr    - show stderr from all child processes
          --no-capture-stderr - don't show stderr from all child processes processes (default)
+ -j      --json              - output the process tree in JSON
 ./procflamegraph -h
 Usage: ./procflamegraph [-pt] [-o file] [--] command [arg...]
        ./procflamegraph [-h|--help]
@@ -26,3 +27,4 @@ Options:
          --no-show-threads   - don't show threads alongside processes (default)
          --capture-stderr    - show stderr from all child processes
          --no-capture-stderr - don't show stderr from all child processes processes (default)
+ -j      --json              - output the process tree in JSON

@@ -1,5 +1,5 @@
 [toolchain]
-channel = "nightly-2025-04-25"
+channel = "nightly-2025-05-24"
 
 # To be able to compile the std library ourselves for a 50% binary size reduction
 components = ["rust-src"]

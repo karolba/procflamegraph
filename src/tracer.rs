@@ -1,17 +1,19 @@
-use crate::{TERMINATION_SIGNAL_CAUGHT, coroutines::CoroutineState, take_over_process, tracee::Tracee, args, errors::log_warn, output_peeker::OutputPeeker, sys_linux::is_fd_a_pipe, sys_linux};
-
+use crate::sys_linux::proc::{process_cmdline, process_is_fd_a_pipe, stat_process_exe};
+use crate::sys_linux::ptrace::Tracee;
+use crate::sys_linux::wait::wait4;
+use crate::{
+    args,
+    coroutines::CoroutineState,
+    errors::log_warn,
+    output_peeker::OutputPeeker,
+    take_over_process,
+    TERMINATION_SIGNAL_CAUGHT,
+};
+use nix::sys::{ptrace, signal, signal::Signal, wait::WaitStatus};
+use std::collections::HashMap;
+use std::mem::MaybeUninit;
+use std::sync::atomic::Ordering;
 use WaitResult::{GotTerminationSignal, Result, WaitpidErr};
-use nix::{
-    fcntl::AtFlags,
-    sys::{ptrace, signal, stat::fstatat, wait::WaitStatus, signal::Signal},
-};
-use std::{
-    collections::{HashMap, HashSet},
-    os::fd::BorrowedFd,
-    sync::atomic::Ordering,
-    mem::MaybeUninit,
-};
-use crate::sys_linux::stat_process_exe;
 
 #[derive(Debug)]
 pub(crate) enum Event {
@@ -64,7 +66,7 @@ fn waitpid_or_signal(rusage: &mut libc::rusage) -> WaitResult {
          */
 
         // use __WALL to wait for all child threads, not only thread group leaders ("processes")
-        match sys_linux::wait4(None, Some(nix::sys::wait::WaitPidFlag::__WALL), rusage) {
+        match wait4(None, Some(nix::sys::wait::WaitPidFlag::__WALL), rusage) {
             Ok(result) => return Result(result),
             Err(nix::errno::Errno::EINTR) => {}
             Err(err) => return WaitpidErr(err),
@@ -96,9 +98,9 @@ fn is_special_secure_exe_screwed(pid: nix::unistd::Pid) -> bool {
 pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &OutputPeeker) -> Vec<Event> {
     use libc::{PTRACE_EVENT_CLONE, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK};
     use nix::{
-        sys::signal::Signal::{SIGKILL, SIGSTOP, SIGTRAP},
-        sys::wait::WaitStatus::{Stopped, PtraceEvent, PtraceSyscall, Exited, Signaled},
-        errno::Errno::ECHILD
+        errno::Errno::ECHILD,
+        sys::signal::Signal::{SIGSTOP, SIGTRAP},
+        sys::wait::WaitStatus::{Exited, PtraceEvent, PtraceSyscall, Signaled, Stopped}
     };
 
     // In this function, many syscalls can be interrupted by EINTR due to how signal handlers are set up
@@ -116,7 +118,7 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
 
     // rusage in libc doesn't derive Default, this is probably the cleanest way to handle it
     // also, maybe it would be better to just return rusage from waitpid_or_signal though
-    let mut rusage: libc::rusage = unsafe { MaybeUninit::<libc::rusage>::zeroed().assume_init() };
+    let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
 
     // todo: handle signal-delivery-stop, "Signal injection and suppression" in the manual
     loop {
@@ -141,15 +143,15 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
 
                 // keep the _fd to close it at the end of the block, after ptrace::cont or
                 // ptrace::syscall (to get to resuming the process execution just a tiny bit faster)
-                let (cmdline, _fd) = match sys_linux::process_cmdline(child) {
+                let (cmdline, _fd) = match process_cmdline(child) {
                     Ok((cmdline, fd)) => (cmdline, Some(fd)),
                     Err(_) => (vec![b'?'], None), // ignore errors - the process could have just died.
                 };
 
                 let take_over_actions = take_over_process::TakeOverActions{
                     tracee: Tracee::from(child),
-                    output_peeker: output_peeker,
-                    do_redirect_stderr: args().capture_stderr && is_fd_a_pipe(child, libc::STDERR_FILENO),
+                    output_peeker,
+                    do_redirect_stderr: args().capture_stderr && process_is_fd_a_pipe(child, libc::STDERR_FILENO),
                     do_reexec: is_special_secure_exe_screwed(child),
                 };
 
@@ -168,6 +170,8 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
                     pid: child,
                     args: cmdline,
                 });
+
+                output_peeker.execve_happened(child);
             }
 
             Result(PtraceSyscall(child)) => {
@@ -235,6 +239,7 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
                     pid,
                     exit_code: exit_code as i64,
                 });
+                output_peeker.thread_died(pid);
             }
             // a process exited by being killed by a signal
             Result(Signaled(pid, signal, generated_core_dump)) => {
@@ -244,6 +249,7 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
                     signal,
                     generated_core_dump,
                 });
+                output_peeker.thread_died(pid);
             }
 
             Result(Stopped(child, signal)) => {

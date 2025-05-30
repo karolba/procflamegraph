@@ -1,8 +1,6 @@
-use crate::{ptrace_syscall_info::{SyscallEntry, SyscallInfo, ptrace_get_syscall_info}, sys_linux};
-
-use std::{
-    os::fd::{OwnedFd},
-};
+use std::os::fd::OwnedFd;
+use crate::sys_linux::proc::process_stat;
+use crate::sys_linux::ptrace_syscall_info::{ptrace_get_syscall_info, SyscallEntry, SyscallInfo};
 
 #[derive(Clone, Copy)]
 pub(crate) struct Tracee {
@@ -123,7 +121,7 @@ impl Tracee {
     pub(crate) fn argv_envp_addrs(self) -> Result<(Option<ArgvEnvpAddrs>, OwnedFd), std::io::Error> {
         use bstr::ByteSlice;
 
-        let (bytes, fd) = sys_linux::process_stat(self.pid)?;
+        let (bytes, fd) = process_stat(self.pid)?;
 
         let after_rparen_idx: usize = match bytes.rfind_byte(b')') {
             Some(x) => x + 2,

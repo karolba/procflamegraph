@@ -1,91 +1,134 @@
+use crate::{
+    sys_linux::fd::{close_two, read_to_maybe_uninit},
+    sys_linux::epoll::epoll_wait,
+    sys_linux::macros::eintr_repeat
+};
 use bstr::ByteVec;
-use std::{
-    thread,
-    collections::HashMap,
-    sync::{Arc, mpsc},
-    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
-    vec::Splice
-};
-use std::thread::JoinHandle;
 use nix::{
-    unistd::{fpathconf, read, write, Pid, SysconfVar},
-    fcntl::{fcntl, tee, F_SETFL, OFlag, SpliceFFlags},
     errno::Errno,
-    sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollOp, EpollTimeout, EpollTimeoutTryFromError},
-    sys::eventfd::{EventFd, EfdFlags},
-    sys::signal::SigSet
+    fcntl::{fcntl, tee, OFlag, SpliceFFlags, F_SETFL},
+    sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags},
+    sys::eventfd::{EfdFlags, EventFd},
+    unistd::Pid
 };
-use crate::{errors, sys_linux};
-use crate::sys_linux::eintr_repeat;
-use crate::sys_linux::epoll_wait;
-
-// https://elixir.bootlin.com/linux/v6.14.6/source/include/uapi/linux/limits.h#L14
-// #define PIPE_BUF        4096	/* # bytes in atomic write to a pipe */
-const PIPE_BUF: usize = 4096;
-
-#[derive(Debug)]
-pub(crate) struct NewChild {
-    pub(crate) pid: Pid,
-    pub(crate) original_stderr: OwnedFd,
-    pub(crate) pipe_from_child: OwnedFd,
-}
+use std::cell::RefCell;
+use std::thread::JoinHandle;
+use std::{
+    collections::HashMap,
+    os::fd::{AsFd, OwnedFd},
+    sync::{mpsc, Arc},
+    thread
+};
+use EpollRegistration::{HasMessages, ReadReady, WriteReady};
+use PidProcessInstanceState::{CurrentlyIntercepting, FinishedIntercepting, NotIntercepting};
 
 #[derive(Debug)]
 pub(crate) struct ChildPeekResult {
     // pub(crate) data: Vec<u8>,
-    pub(crate) data: String,
+    pub(crate) data: Vec<String>,
 }
 
-struct Child {
-    pid: Pid,
-    // todo: those shouldn't really be optional, let the object be destroyed and just move the vec out when closing
-    original_stderr: OwnedFd,
-    pipe_from_child: OwnedFd,
-    captured_data: Vec<u8>
+structstruck::strike! {
+    #[derive(Default)]
+    struct PidEntry {
+        instances: Vec<#[derive(Default)] struct PidProcessInstance {
+            state: #[derive(Default)] enum PidProcessInstanceState {
+                #[default] NotIntercepting,
+                CurrentlyIntercepting(struct InterceptingProcessInstance {
+                    original_stderr: OwnedFd,
+                    pipe_from_child: OwnedFd,
+                    captured_data: Vec<u8>,
+                }),
+                FinishedIntercepting {
+                    captured_data: Vec<u8>
+                },
+            },
+            visited_for_data_ready: bool,
+        }>,
+        is_dead: bool,
+    }
 }
 
-enum OutputPeekerMessage {
-    NewChild(NewChild),
-    End
+structstruck::strike! {
+    enum OutputPeekerMessage {
+        QueuedMessages(Vec<enum QueuedOutputPeekerMessage {
+            ThreadExecved(Pid),
+            ThreadDied(Pid),
+        }>),
+        StartPeeking(pub(crate) struct StartPeeking {
+            pub(crate) pid: Pid,
+            pub(crate) original_stderr: OwnedFd,
+            pub(crate) pipe_from_child: OwnedFd,
+        }),
+        End,
+    }
 }
+
 pub(crate) struct OutputPeeker {
     sender: mpsc::Sender<OutputPeekerMessage>,
     join_handle: JoinHandle<HashMap<Pid, ChildPeekResult>>,
     sent_notif: Arc<EventFd>,
+    queued_messages: RefCell<Vec<QueuedOutputPeekerMessage>>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct ThreadInstanceIndex(u32);
+impl ThreadInstanceIndex {
+    fn new(val: u32) -> ThreadInstanceIndex {
+        if val > 0x3fff_ffffu32 {
+            panic!("ThreadInstanceIndex is too big"); // todo maybe just wrap around at this point
+        }
+        ThreadInstanceIndex(val)
+    }
+    fn as_usize(&self) -> usize {
+        self.0 as usize
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
 enum EpollRegistration {
     HasMessages,
-    ReadReady(Pid),
-    WriteReady(Pid),
+    ReadReady(Pid, ThreadInstanceIndex),
+    WriteReady(Pid, ThreadInstanceIndex),
 }
 
-impl Child {
-    fn new_with_epoll_registration(epoll: &Epoll, pid: Pid, original_stderr: OwnedFd, pipe_from_child: OwnedFd) -> Child {
+impl InterceptingProcessInstance {
+    fn new(original_stderr: OwnedFd, pipe_from_child: OwnedFd) -> InterceptingProcessInstance {
         // todo: maybe even do this somewhere else before without a fcntl if possible?
         fcntl(&pipe_from_child, F_SETFL(OFlag::O_NONBLOCK))
             .expect("couldn't set pipe_from_child to O_NONBLOCK");
         fcntl(&original_stderr, F_SETFL(OFlag::O_NONBLOCK))
             .expect("couldn't set original_stderr to O_NONBLOCK");
 
-        epoll.add(&pipe_from_child, EpollEvent::new(
-            EpollFlags::EPOLLIN | EpollFlags::EPOLLET,
-            EpollRegistration::ReadReady(pid).serialize()
-        )).expect("couldn't add pipe_from_child to epoll");
-
-        epoll.add(&original_stderr, EpollEvent::new(
-            EpollFlags::EPOLLOUT | EpollFlags::EPOLLET,
-            EpollRegistration::WriteReady(pid).serialize()
-        )).expect("couldn't add original_stderr to epoll");
-
-        Child {
-            pid,
-            original_stderr: original_stderr,
-            pipe_from_child: pipe_from_child,
+        InterceptingProcessInstance {
+            original_stderr,
+            pipe_from_child,
             captured_data: vec![],
         }
     }
+
+    fn register_epoll_write(&self, epoll: &Epoll, pid: Pid, index: ThreadInstanceIndex) {
+        epoll.add(self.pipe_from_child.as_fd(), EpollEvent::new(
+            EpollFlags::EPOLLIN | EpollFlags::EPOLLET,
+            ReadReady(pid, index).serialize()
+        )).expect("couldn't add pipe_from_child to epoll");
+    }
+
+    fn register_epoll_read(&self, epoll: &Epoll, pid: Pid, index: ThreadInstanceIndex) {
+        epoll.add(self.original_stderr.as_fd(), EpollEvent::new(
+            EpollFlags::EPOLLOUT | EpollFlags::EPOLLET,
+            WriteReady(pid, index).serialize()
+        )).expect("couldn't add original_stderr to epoll");
+    }
+
+    fn deregister_epoll_write(&self, epoll: &Epoll) {
+        epoll.delete(self.pipe_from_child.as_fd()).expect("Couldn't EPOLL_CTL_DEL pipe_from_child");
+    }
+
+    fn deregister_epoll_read(&self, epoll: &Epoll) {
+        epoll.delete(self.original_stderr.as_fd()).expect("Couldn't EPOLL_CTL_DEL original_stderr");
+    }
+
     fn data_ready(&mut self) {
         loop {
             match eintr_repeat!(tee(
@@ -100,12 +143,12 @@ impl Child {
 
                     // get all data
                     while to_read > 0 {
-                        let read_num = eintr_repeat!(sys_linux::read_to_maybe_uninit(
+                        let read_num = eintr_repeat!(read_to_maybe_uninit(
                             self.pipe_from_child.as_fd(),
                             &mut self.captured_data.spare_capacity_mut()[..to_read],
-                        )).expect("this shouldn't fail");
+                        )).expect("this shouldn't fail, todo better error message here");
 
-                        assert_ne!(read_num, 0, "???");
+                        assert_ne!(read_num, 0, "??? todo better error message");
 
                         to_read -= read_num;
                         unsafe { self.captured_data.set_len(self.captured_data.len() + read_num); }
@@ -116,122 +159,214 @@ impl Child {
             }
         }
     }
+
 }
 
+impl PidEntry {
+    fn has_pipes_open(&self) -> bool {
+        self.instances
+            .iter()
+            .rev()
+            .any(|pid_process_instance| matches!(pid_process_instance.state, CurrentlyIntercepting(..)))
+    }
+    fn are_we_done_with_it(&self) -> bool {
+        self.is_dead && !self.has_pipes_open()
+    }
+    fn finalize(mut self) -> ChildPeekResult {
+        ChildPeekResult{
+            data: self.instances.iter_mut().map(|instance| {
+                match std::mem::replace(&mut instance.state, NotIntercepting) {
+                    FinishedIntercepting{captured_data} => captured_data.into_string_lossy(),
+                    NotIntercepting => "".to_owned(),
+                    CurrentlyIntercepting(..) => {
+                        panic!("Trying to finalize a PidProcessInstance that's still in a CurrentlyIntercepting state");
+                    }
+                }
+            }).collect()
+        }
+    }
+}
+
+// encode the EpollRegistration enum into a single u64 so that the linux epoll api can give it back to us
+// todo, this is pretty tedious, is there a simple method to do it in a more readable way, like a bitfield?
 impl EpollRegistration {
+    /*
+     * this is roughly what EpollRegistration serializes to:
+     *
+     * struct SerializedEpollRegistration {
+     *    bool eventfd_message : 1;
+     *    enum { READ_READY = 0, WRITE_READY = 1 } : 1;
+     *    uint32_t thread_instance_index : 30;
+     *    uint32_t pid : 32;
+     * };
+     */
+
     fn serialize(self) -> u64 {
         match self {
-            EpollRegistration::HasMessages => u64::MAX,
-            EpollRegistration::ReadReady(pid) => pid.as_raw() as u64,
-            EpollRegistration::WriteReady(pid) => pid.as_raw() as u64 | (1u64 << 32),
+            HasMessages => u64::MAX,
+            ReadReady(pid, ThreadInstanceIndex(index)) => {
+                (pid.as_raw() as u64) | ((index as u64) << 32)
+            },
+            WriteReady(pid, ThreadInstanceIndex(index)) => {
+                (pid.as_raw() as u64) | ((index as u64) << 32) | (1u64 << 62)
+            },
         }
     }
 
     fn deserialize(data: u64) -> EpollRegistration {
         match data {
-            u64::MAX => EpollRegistration::HasMessages,
+            u64::MAX => HasMessages,
             data => {
-                if (data & (1u64 << 32)) == 0 {
-                    EpollRegistration::ReadReady(Pid::from_raw(data as i32))
+                if (data & (1u64 << 62)) == 0 {
+                    ReadReady(
+                        Pid::from_raw(data as i32),
+                        ThreadInstanceIndex::new(((data & 0x3fff_ffff_0000_0000u64) >> 32) as u32),
+                    )
                 } else {
-                    EpollRegistration::WriteReady(Pid::from_raw(data as i32))
+                    WriteReady(
+                        Pid::from_raw(data as i32),
+                        ThreadInstanceIndex::new(((data & 0x3fff_ffff_0000_0000u64) >> 32) as u32),
+                    )
                 }
             }
         }
     }
 }
 
+enum Message {
+    ThreadExecved(Pid),
+    ThreadDied(Pid),
+    StartPeeking(StartPeeking),
+    End,
+}
+gen fn recv_messages(receiver: &mpsc::Receiver<OutputPeekerMessage>, new_child_notif: &EventFd) -> Message {
+    for _ in 0..new_child_notif.read().expect("couldn't read from an eventfd") {
+        match receiver.recv().expect("couldn't receive a NewChild from mpsc::Receiver") {
+            OutputPeekerMessage::QueuedMessages(messages) => {
+                for queued_message in messages {
+                    match queued_message {
+                        QueuedOutputPeekerMessage::ThreadExecved(pid) => yield Message::ThreadExecved(pid),
+                        QueuedOutputPeekerMessage::ThreadDied(pid) => yield Message::ThreadDied(pid),
+                    }
+                }
+            }
+            OutputPeekerMessage::StartPeeking(start) => yield Message::StartPeeking(start),
+            OutputPeekerMessage::End => yield Message::End,
+        }
+    }
+}
 
 fn peeker_thread(receiver: mpsc::Receiver<OutputPeekerMessage>, new_child_notif: Arc<EventFd>) -> HashMap<Pid, ChildPeekResult> {
     let epoll = Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC).expect("couldn't epoll_create");
 
     epoll
-        .add(&new_child_notif, EpollEvent::new(EpollFlags::EPOLLIN, EpollRegistration::HasMessages.serialize()))
+        .add(&new_child_notif, EpollEvent::new(EpollFlags::EPOLLIN, HasMessages.serialize()))
         .expect("couldn't epoll_ctl(epoll, EPOLL_CTL_ADD) for an eventfd");
 
-    struct ChildEntry {
-        child: Child,
-        visited_for_data_ready: bool,
-    }
-    let mut children: HashMap<Pid, ChildEntry> = HashMap::new();
+    let mut children: HashMap<Pid, PidEntry> = HashMap::new();
     let mut ending = false;
     let mut result: HashMap<Pid, ChildPeekResult> = HashMap::new();
-    let mut events = [EpollEvent::empty(); 32];
+    let mut events_buf = [EpollEvent::empty(); 32];
 
-    loop {
-        if ending && children.is_empty() {
-            break;
-        }
+    while !(ending && children.is_empty()) {
+        let num_events = epoll_wait(&epoll, &mut events_buf);
+        let events = || {
+            events_buf[..num_events]
+                .iter()
+                .map(|epoll_event: &EpollEvent| (
+                    EpollRegistration::deserialize(epoll_event.data()),
+                    epoll_event.events(),
+                ))
+        };
 
-        let num_events = epoll_wait(&epoll, &mut events);
-        for event in events[..num_events].iter() {
-            let flags = event.events();
-            match EpollRegistration::deserialize(event.data()) {
-                EpollRegistration::HasMessages => {
-                    for _ in 0..new_child_notif.read().expect("couldn't read from an eventfd") {
-                        match receiver.recv().expect("couldn't receive a NewChild from mpsc::Receiver") {
-                            OutputPeekerMessage::NewChild(NewChild { pid, original_stderr, pipe_from_child }) => {
-                                children.insert(pid, ChildEntry {
-                                    child: Child::new_with_epoll_registration(&epoll, pid, original_stderr, pipe_from_child),
-                                    visited_for_data_ready: false,
-                                });
+        for (event, flags) in events() {
+            if matches!(event, HasMessages) {
+                for message in recv_messages(&receiver, new_child_notif.as_ref()) {
+                    match message {
+                        Message::StartPeeking(StartPeeking { pid, original_stderr, pipe_from_child }) => {
+                            let pid_entry = children.get_mut(&pid).unwrap();
+                            let instance = InterceptingProcessInstance::new(original_stderr, pipe_from_child);
+                            let index = ThreadInstanceIndex::new((pid_entry.instances.len() - 1).try_into().unwrap());
+                            instance.register_epoll_read(&epoll, pid, index);
+                            instance.register_epoll_write(&epoll, pid, index);
+                            pid_entry.instances.last_mut().unwrap().state = CurrentlyIntercepting(instance);
+                        }
+                        Message::ThreadExecved(pid) => {
+                            // either a completely new thread did an execve
+                            // or an already exiting one
+                            children
+                                .entry(pid)
+                                .or_insert_with(|| PidEntry::default())
+                                .instances.push(PidProcessInstance::default());
+                        }
+                        Message::ThreadDied(pid) => {
+                            if let Some(child) = children.get_mut(&pid) {
+                                child.is_dead = true;
+                                if child.are_we_done_with_it() {
+                                    result.insert(pid, children.remove(&pid).unwrap().finalize());
+                                }
                             }
-                            OutputPeekerMessage::End => {
-                                ending = true;
-                            }
+                        }
+                        Message::End => {
+                            ending = true;
                         }
                     }
                 }
-                EpollRegistration::ReadReady(pid) | EpollRegistration::WriteReady(pid) => {
-                    let child_entry = children.get_mut(&pid).unwrap();
+            }
 
-                    if flags.intersects(EpollFlags::EPOLLIN | EpollFlags::EPOLLOUT) {
-                        if !child_entry.visited_for_data_ready {
-                            child_entry.child.data_ready();
-                            child_entry.visited_for_data_ready = true;
-                        }
+            if let ReadReady(pid, instance_index) | WriteReady(pid, instance_index) = event
+                && flags.intersects(EpollFlags::EPOLLIN | EpollFlags::EPOLLOUT)
+                && let Some(pid_entry) = children.get_mut(&pid)
+                && let Some(instance) = pid_entry.instances.get_mut(instance_index.as_usize())
+            {
+                match instance {
+                    PidProcessInstance{visited_for_data_ready: true, state: CurrentlyIntercepting(..)} => {},
+                    PidProcessInstance{visited_for_data_ready: false, state: CurrentlyIntercepting(intercepting)} => {
+                        intercepting.data_ready();
+                        instance.visited_for_data_ready = true;
+                    }
+                    PidProcessInstance{visited_for_data_ready: _, state: NotIntercepting } => {
+                        panic!("Received EPOLLIN or EPOLLOUT on a child that wasn't being intercepted");
+                    }
+                    PidProcessInstance{visited_for_data_ready: _, state: FinishedIntercepting{..}} => {
+                        panic!("Received EPOLLIN or EPOLLOUT on a child that has already been finished");
                     }
                 }
             }
         }
 
         // reset them so they can be visited again in the next epoll loop
-        for event in events[..num_events].iter() {
-            match EpollRegistration::deserialize(event.data()) {
-                EpollRegistration::HasMessages => {}
-                EpollRegistration::ReadReady(pid) | EpollRegistration::WriteReady(pid) => {
-                    let child = children.get_mut(&pid).unwrap();
-                    child.visited_for_data_ready = false;
-                }
+        for (event, flags) in events() {
+            if let ReadReady(pid, instance_index) | WriteReady(pid, instance_index) = event
+                && flags.intersects(EpollFlags::EPOLLIN | EpollFlags::EPOLLOUT)
+                && let Some(pid_entry) = children.get_mut(&pid)
+                && let Some(instance) = pid_entry.instances.get_mut(instance_index.as_usize())
+            {
+                instance.visited_for_data_ready = false;
             }
         }
 
-        // handle closing/erroring out if everything was already read
-        // todo: maybe it doesn't even need to be in its own loop?
-        for event in events[..num_events].iter() {
-            let flags = event.events();
-            match EpollRegistration::deserialize(event.data()) {
-                EpollRegistration::HasMessages => {}
-                EpollRegistration::ReadReady(pid) | EpollRegistration::WriteReady(pid) => {
-                    if flags.intersects(EpollFlags::EPOLLHUP | EpollFlags::EPOLLERR) {
-                        match children.remove(&pid) {
-                            None => { /* probably already removed it in the same iteration already */ }
-                            Some(ChildEntry{child, ..}) => {
-                                epoll.delete(child.pipe_from_child.as_fd())
-                                    .expect("Couldn't EPOLL_CTL_DEL a pipe_from_child");
+        // handle closing/erroring out only when everything was already read
+        for (event, flags) in events() {
+            if flags.intersects(EpollFlags::EPOLLHUP | EpollFlags::EPOLLERR)
+                && let ReadReady(pid, instance_index) | WriteReady(pid, instance_index) = event
+                && let Some(pid_entry) = children.get_mut(&pid)
+                && let Some(instance) = pid_entry.instances.get_mut(instance_index.as_usize())
+                && let CurrentlyIntercepting(_) = instance.state // make sure that is really the type before replacing it
+                && let CurrentlyIntercepting(intercepting) = std::mem::replace(&mut instance.state, NotIntercepting)
+            {
+                intercepting.deregister_epoll_read(&epoll);
+                intercepting.deregister_epoll_write(&epoll);
 
-                                epoll.delete(child.original_stderr.as_fd())
-                                    .expect("Couldn't EPOLL_CTL_DEL original_stderr");
+                // try to close them in a single syscall if possible
+                close_two(intercepting.pipe_from_child, intercepting.original_stderr);
 
-                                result.insert(pid, ChildPeekResult{
-                                    data: child.captured_data.into_string_lossy()
-                                });
+                instance.state = FinishedIntercepting {
+                    captured_data: intercepting.captured_data
+                };
 
-                                // try to close them in a single syscall if possible
-                                sys_linux::close_two(child.pipe_from_child, child.original_stderr);
-                            }
-                        }
-                    }
+                if pid_entry.are_we_done_with_it() {
+                    result.insert(pid, children.remove(&pid).unwrap().finalize());
                 }
             }
         }
@@ -247,28 +382,48 @@ impl OutputPeeker {
 
         let efd_arg = Arc::clone(&efd);
         let join_handle = thread::Builder::new()
-            .name("stderr-collector".to_string())
-            .spawn(move || peeker_thread(receiver, efd_arg))
+            .name("stderr-collector".to_owned())
+            .spawn(|| peeker_thread(receiver, efd_arg))
             .expect("failed to spawn thread");
 
         OutputPeeker{
-            sender: sender,
+            sender,
             join_handle,
             sent_notif: efd,
+            queued_messages: RefCell::new(vec![]),
         }
     }
 
-    pub(crate) fn send(&self, new_child: NewChild) {
-        self.sender.send(OutputPeekerMessage::NewChild(new_child)).expect("couldn't send to the OutputPeeker thread");
-        self.sent_notif.write(1).expect("couldn't write to eventfd");
+    fn send(&self, message: OutputPeekerMessage) {
+        if self.queued_messages.borrow().is_empty() {
+            self.sender.send(message).unwrap();
+            self.sent_notif.write(1).expect("couldn't write to eventfd");
+        } else {
+            let queued_messages = OutputPeekerMessage::QueuedMessages(self.queued_messages.replace(vec![]));
+            self.sender.send(queued_messages).unwrap();
+            self.sender.send(message).unwrap();
+            self.sent_notif.write(2).expect("couldn't write to eventfd");
+        }
     }
 
-    pub(crate) fn finish(&self) {
-        self.sender.send(OutputPeekerMessage::End).expect("couldn't send to the OutputPeeker thread");
-        self.sent_notif.write(1).expect("couldn't write to eventfd");
+    pub(crate) fn execve_happened(&self, pid: Pid) {
+        // there's no hurry to inform the other thread and doing so results in 3 syscalls, so let's
+        // buffer that
+        self.queued_messages.borrow_mut().push(QueuedOutputPeekerMessage::ThreadExecved(pid));
+    }
+
+    pub(crate) fn thread_died(&self, pid: Pid) {
+        // there's no hurry to inform the other thread and doing so results in 3 syscalls, so let's
+        // buffer that
+        self.queued_messages.borrow_mut().push(QueuedOutputPeekerMessage::ThreadDied(pid));
+    }
+
+    pub(crate) fn start_peeking_child(&self, new_child: StartPeeking) {
+        self.send(OutputPeekerMessage::StartPeeking(new_child));
     }
 
     pub(crate) fn result(self) -> HashMap<Pid, ChildPeekResult> {
+        self.send(OutputPeekerMessage::End);
         self.join_handle.join().expect("couldn't join thread 'stderr-collector'")
     }
 }
