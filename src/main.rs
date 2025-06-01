@@ -1,6 +1,5 @@
 #![feature(gen_blocks)]
 #![feature(maybe_uninit_slice)]
-#![feature(let_chains)]
 
 mod args;
 mod coroutines;
@@ -12,9 +11,11 @@ mod tracer;
 mod output;
 
 use crate::{
+    output::events_to_processes,
     errors::log_warn,
     output::output_process_tree,
     sys_linux::kernel_version::kernel_major_minor,
+    tracer::waitpid_loop
 };
 use nix::{
     sys::{ptrace, signal::Signal},
@@ -99,6 +100,7 @@ fn exec_traced_child(opts: ExecTracedChildOptions) -> ! {
 
 fn run_in_fork<F: FnOnce() -> ()>(run_child: F) -> nix::unistd::Pid {
     // safety: can really only call this function when no more than 1 thread is yet to run
+    // (calling fork ourselves is not thread-safe)
     match unsafe { fork() }.expect("fork() failed") {
         ForkResult::Parent { child } => child,
         ForkResult::Child => {
@@ -176,14 +178,16 @@ fn main() -> ExitCode {
     let output_peeker = output_peeker::OutputPeeker::new();
 
     setup_termination_signal_handler();
-    let events = tracer::waitpid_loop(child_pid, &output_peeker);
+    let events = waitpid_loop(child_pid, &output_peeker);
     // if we've got here we'll exit shortly anyway so ignore SIGTERM and SIGINT instead of using SigDfl
     ignore_termination_signals();
 
     // todo: output_peeker.result() waits on all pipes to close
     //       this should probably be interruptable with SIGTERM/SIGINT
     //       maybe we could even have a default timeout if a SIGTERM/SIGINT was received before?
-    let root_process_exit = output_process_tree(events, child_pid, output_peeker.result());
+    let processes = events_to_processes(events, output_peeker.result());
+
+    let root_process_exit = output_process_tree(child_pid, processes);
 
     ExitCode::from(match root_process_exit {
         None => 1,

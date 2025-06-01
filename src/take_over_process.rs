@@ -38,7 +38,12 @@ gen fn do_syscall(tracee: Tracee) -> CoroutineState<(), nix::Result<SyscallExit>
     co_yield!(()); // continue to syscall exit
     let exit = co_try!(co_yield_from!(wait_for_syscall_exit(tracee))); // make sure we really are in a syscall exit
     co_yield!(()); // continue to syscall entry
-    co_try!(co_yield_from!(wait_for_syscall_entry(tracee))); // make sure we really are in a syscall entry
+
+    // the ptrace api practically guarantees syscall entry and exit always successively alternate
+    // assuming that's true (other tracers seem to assume that too), we don't need to spend time
+    // checking the assumption
+    // co_try!(co_yield_from!(wait_for_syscall_entry(tracee)));
+
     co_return!(Ok(exit));
 }
 
@@ -96,6 +101,8 @@ impl TakeOverActions<'_> {
 
     pub(crate) gen fn take_over_step(self) -> CoroutineState<(), Result<TakeOverResult, TakeOverError>> {
         // make sure we're in syscall-entry, not syscall-exit
+        // todo: the first thing a process does seems to be syscall-exit, not syscall-entry
+        //       could probably use that to save the needless wait (and syscalls spent) for syscall-entry
         let original_syscall_entry: SyscallEntry = co_yield_from!(wait_for_syscall_entry(self.tracee)).expect("TODO");
         let original_regset = self.tracee.getregset().unwrap_or_else(|_| todo!("check this error"));
         let redo_syscall_again_regset = roll_instruction_pointer_back_over_syscall_instruction(original_regset);

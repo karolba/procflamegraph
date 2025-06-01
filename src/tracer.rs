@@ -1,24 +1,31 @@
-use crate::sys_linux::proc::{process_cmdline, process_is_fd_a_pipe, stat_process_exe};
-use crate::sys_linux::ptrace::Tracee;
-use crate::sys_linux::wait::wait4;
 use crate::{
     args,
     coroutines::CoroutineState,
     errors::log_warn,
     output_peeker::OutputPeeker,
+    sys_linux::proc::{process_cmdline, process_is_fd_a_pipe, stat_process_exe},
+    sys_linux::ptrace::Tracee,
+    sys_linux::wait::wait4,
     take_over_process,
-    TERMINATION_SIGNAL_CAUGHT,
+    TERMINATION_SIGNAL_CAUGHT
 };
+use libc::{PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK, PTRACE_EVENT_CLONE};
 use nix::sys::{ptrace, signal, signal::Signal, wait::WaitStatus};
+use nix::unistd::Pid;
+use nix::{
+    errno::Errno::ECHILD,
+    sys::signal::Signal::{SIGSTOP, SIGTRAP},
+    sys::wait::WaitStatus::{Exited, PtraceEvent, PtraceSyscall, Signaled, Stopped}
+};
 use std::collections::HashMap;
-use std::mem::MaybeUninit;
+use std::hash::Hash;
 use std::sync::atomic::Ordering;
 use WaitResult::{GotTerminationSignal, Result, WaitpidErr};
 
 #[derive(Debug)]
 pub(crate) enum Event {
     NewChild { parent: nix::unistd::Pid, child: nix::unistd::Pid },
-    Exec { rusage: libc::rusage, pid: nix::unistd::Pid, _former_thread_id: nix::unistd::Pid, args: Vec<u8> },
+    Exec { rusage: libc::rusage, pid: nix::unistd::Pid, args: Vec<u8> },
     NormalExit { rusage: libc::rusage, pid: nix::unistd::Pid, exit_code: i64 },
     KilledBySignal { rusage: libc::rusage, pid: nix::unistd::Pid, signal: Signal, generated_core_dump: bool },
 }
@@ -37,7 +44,7 @@ fn setup_ptrace_for_child(child: nix::unistd::Pid) {
         | ptrace::Options::PTRACE_O_TRACEEXEC
         | ptrace::Options::PTRACE_O_TRACEFORK
         | ptrace::Options::PTRACE_O_TRACEVFORK // do we care about vfork vs vforkdone?
-        | ptrace::Options::PTRACE_O_TRACECLONE, // can be useful to track which PIDs are threads of a process
+        | ptrace::Options::PTRACE_O_TRACECLONE // not tracing threads makes us miss some processes
     )
     .ok(); // TODO: ignoring errors (if process hasn't stopped because of us), but is that right?
     // if this fails then continue the process and buffer the signal (...)
@@ -96,12 +103,6 @@ fn is_special_secure_exe_screwed(pid: nix::unistd::Pid) -> bool {
 }
 
 pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &OutputPeeker) -> Vec<Event> {
-    use libc::{PTRACE_EVENT_CLONE, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK};
-    use nix::{
-        errno::Errno::ECHILD,
-        sys::signal::Signal::{SIGSTOP, SIGTRAP},
-        sys::wait::WaitStatus::{Exited, PtraceEvent, PtraceSyscall, Signaled, Stopped}
-    };
 
     // In this function, many syscalls can be interrupted by EINTR due to how signal handlers are set up
     // Make sure that's handled gracefully.
@@ -111,13 +112,10 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
 
     let mut events: Vec<Event> = vec![];
 
-    let mut pids_to_kill: Vec<nix::unistd::Pid> = vec![];
-
     // uses an unnamed type: HashMap<nix::unistd::Pid, {running-coroutine}>
-    let mut take_over_process_coroutinies: HashMap<nix::unistd::Pid, _> = HashMap::new();
+    let mut take_over_process_coroutines: HashMap<Pid, _> = HashMap::new();
 
     // rusage in libc doesn't derive Default, this is probably the cleanest way to handle it
-    // also, maybe it would be better to just return rusage from waitpid_or_signal though
     let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
 
     // todo: handle signal-delivery-stop, "Signal injection and suppression" in the manual
@@ -139,7 +137,12 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
                 }
             }
             Result(PtraceEvent(child, SIGTRAP, PTRACE_EVENT_EXEC)) => {
-                let former_thread_id = ptrace::getevent(child).unwrap_or(-1);
+                // `child` is the PID of the main thread in the process group that does an exec.
+                // ptrace::getevent(child) can be used to get the PID of the thread that really
+                // invoked execve
+
+                // execing invalidates anything we were doing in take_over_process
+                take_over_process_coroutines.remove(&child);
 
                 // keep the _fd to close it at the end of the block, after ptrace::cont or
                 // ptrace::syscall (to get to resuming the process execution just a tiny bit faster)
@@ -156,7 +159,7 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
                 };
 
                 if take_over_actions.is_any_action_set() {
-                    take_over_process_coroutinies.insert(child, take_over_actions.take_over_step());
+                    take_over_process_coroutines.insert(child, take_over_actions.take_over_step());
 
                     // stop at the next syscall. We'll hijack the process and set it up for shenanigans
                     ptrace::syscall(child, None).ok();
@@ -166,7 +169,6 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
 
                 events.push(Event::Exec {
                     rusage,
-                    _former_thread_id: nix::unistd::Pid::from_raw(former_thread_id as libc::pid_t),
                     pid: child,
                     args: cmdline,
                 });
@@ -175,14 +177,14 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
             }
 
             Result(PtraceSyscall(child)) => {
-                match take_over_process_coroutinies.get_mut(&child).and_then(|coroutine| coroutine.next()) {
+                match take_over_process_coroutines.get_mut(&child).and_then(|coroutine| coroutine.next()) {
                     Some(CoroutineState::Complete(Ok(take_over_process::TakeOverResult::ContinueExecuting()))) => {
                         // Our modifications to the process have been done. Let the child continue
                         // executing normally, without stopping on syscalls.
                         cont(child, None).ok();
 
                         // The coroutine is over, no longer need it
-                        take_over_process_coroutinies.remove(&child);
+                        take_over_process_coroutines.remove(&child);
                     },
 
                     Some(CoroutineState::Complete(Ok(take_over_process::TakeOverResult::ReexecSetupDetach()))) => {
@@ -192,7 +194,7 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
                         ptrace::detach(child, None).ok();
 
                         // The coroutine is over, no longer need it
-                        take_over_process_coroutinies.remove(&child);
+                        take_over_process_coroutines.remove(&child);
                     },
 
                     Some(CoroutineState::Complete(Err(_))) => {
@@ -203,7 +205,7 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
                         cont(child, None).ok();
 
                         // The coroutine is over, no longer need it
-                        take_over_process_coroutinies.remove(&child);
+                        take_over_process_coroutines.remove(&child);
                     },
 
                     Some(CoroutineState::Yielded(())) => {
@@ -218,20 +220,19 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
                 };
             }
 
-            Result(PtraceEvent(child, SIGTRAP, PTRACE_EVENT_CLONE | PTRACE_EVENT_FORK | PTRACE_EVENT_VFORK)) => {
+            Result(PtraceEvent(child, SIGTRAP, PTRACE_EVENT_FORK | PTRACE_EVENT_VFORK | PTRACE_EVENT_CLONE)) => {
                 let new_thread_id = ptrace::getevent(child);
                 cont(child, None).ok(); // ignore errors - the child could have died
 
                 // Ignore getevent failing - the child was most likely SIGKILLed
                 if let Ok(thread_id) = new_thread_id {
-                    pids_to_kill.push(nix::unistd::Pid::from_raw(thread_id as libc::pid_t));
-
                     events.push(Event::NewChild {
-                        child: nix::unistd::Pid::from_raw(thread_id as libc::pid_t),
+                        child: Pid::from_raw(thread_id as libc::pid_t),
                         parent: child,
                     });
                 }
             }
+
             // a process exited normally
             Result(Exited(pid, exit_code)) => {
                 events.push(Event::NormalExit {
@@ -240,6 +241,7 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
                     exit_code: exit_code as i64,
                 });
                 output_peeker.thread_died(pid);
+                take_over_process_coroutines.remove(&pid);
             }
             // a process exited by being killed by a signal
             Result(Signaled(pid, signal, generated_core_dump)) => {
@@ -250,6 +252,7 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
                     generated_core_dump,
                 });
                 output_peeker.thread_died(pid);
+                take_over_process_coroutines.remove(&pid);
             }
 
             Result(Stopped(child, signal)) => {

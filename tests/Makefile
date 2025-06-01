@@ -20,7 +20,7 @@ all: $(HELPER_BINARIES) $(TESTS)
 procflamegraph: $(BIN)
 	$(Q)ln -fs $(BIN) procflamegraph
 
-artifacts/%: helpers/%.cpp common.hpp Makefile
+artifacts/%: helpers/%.cpp helpers/common.hpp Makefile
 	$(Q)mkdir -p artifacts
 	$(CXX) $(CXXFLAGS) helpers/$(*F).cpp -o $@
 

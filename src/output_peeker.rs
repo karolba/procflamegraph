@@ -3,7 +3,6 @@ use crate::{
     sys_linux::epoll::epoll_wait,
     sys_linux::macros::eintr_repeat
 };
-use bstr::ByteVec;
 use nix::{
     errno::Errno,
     fcntl::{fcntl, tee, OFlag, SpliceFFlags, F_SETFL},
@@ -25,7 +24,7 @@ use PidProcessInstanceState::{CurrentlyIntercepting, FinishedIntercepting, NotIn
 #[derive(Debug)]
 pub(crate) struct ChildPeekResult {
     // pub(crate) data: Vec<u8>,
-    pub(crate) data: Vec<String>,
+    pub(crate) data: Vec<Vec<u8>>,
 }
 
 structstruck::strike! {
@@ -176,8 +175,8 @@ impl PidEntry {
         ChildPeekResult{
             data: self.instances.iter_mut().map(|instance| {
                 match std::mem::replace(&mut instance.state, NotIntercepting) {
-                    FinishedIntercepting{captured_data} => captured_data.into_string_lossy(),
-                    NotIntercepting => "".to_owned(),
+                    FinishedIntercepting{captured_data} => captured_data,
+                    NotIntercepting => vec![],
                     CurrentlyIntercepting(..) => {
                         panic!("Trying to finalize a PidProcessInstance that's still in a CurrentlyIntercepting state");
                     }
@@ -241,7 +240,7 @@ enum Message {
 }
 gen fn recv_messages(receiver: &mpsc::Receiver<OutputPeekerMessage>, new_child_notif: &EventFd) -> Message {
     for _ in 0..new_child_notif.read().expect("couldn't read from an eventfd") {
-        match receiver.recv().expect("couldn't receive a NewChild from mpsc::Receiver") {
+        match receiver.recv().expect("couldn't receive from mpsc::Receiver") {
             OutputPeekerMessage::QueuedMessages(messages) => {
                 for queued_message in messages {
                     match queued_message {
@@ -325,7 +324,7 @@ fn peeker_thread(receiver: mpsc::Receiver<OutputPeekerMessage>, new_child_notif:
                         intercepting.data_ready();
                         instance.visited_for_data_ready = true;
                     }
-                    PidProcessInstance{visited_for_data_ready: _, state: NotIntercepting } => {
+                    PidProcessInstance{visited_for_data_ready: _, state: NotIntercepting} => {
                         panic!("Received EPOLLIN or EPOLLOUT on a child that wasn't being intercepted");
                     }
                     PidProcessInstance{visited_for_data_ready: _, state: FinishedIntercepting{..}} => {
