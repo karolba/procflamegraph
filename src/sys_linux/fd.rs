@@ -6,6 +6,8 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::errors::error_out;
+
 pub(crate) fn read_to_maybe_uninit(fd: BorrowedFd, buf: &mut [MaybeUninit<u8>]) -> Result<usize, Errno> {
     let fd = fd.as_raw_fd();
     let len = buf.len() as libc::size_t;
@@ -62,13 +64,15 @@ pub(crate) fn close_two(fd1: OwnedFd, fd2: OwnedFd) {
     let (first, second) = if fd1.as_raw_fd() < fd2.as_raw_fd() { (fd1, fd2) } else { (fd2, fd1) };
 
     match close_range(first.as_raw_fd(), second.as_raw_fd(), None) {
-        Ok(()) => {
-            std::mem::forget(first);
-            std::mem::forget(second);
-        }
         Err(Errno::ENOSYS) => {
             CLOSE_RANGE_SYSCALL_EXISTS.store(false, Ordering::Relaxed);
         }
-        Err(_) => {}
+        Err(Errno::EBADF) => {
+            error_out!("Couldn't close file descriptors {} and {}: EBADF", first.as_raw_fd(), second.as_raw_fd());
+        }
+        Ok(()) | Err(_) => { // we have to assume all other errors mean the fds are already closed
+            std::mem::forget(first);
+            std::mem::forget(second);
+        }
     }
 }

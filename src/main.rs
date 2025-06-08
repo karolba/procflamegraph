@@ -23,8 +23,6 @@ use nix::{
 };
 use std::{
     ffi::CString,
-    io::Write,
-    os::fd::AsFd,
     process::ExitCode,
     sync::atomic::{AtomicBool, Ordering},
     sync::OnceLock,

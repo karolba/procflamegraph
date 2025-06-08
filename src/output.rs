@@ -176,30 +176,37 @@ pub(crate) fn events_to_processes(events: Vec<Event>, mut captured_output: HashM
     for event in events {
         match event {
             Event::NewChild { child, parent } => {
-                let parent = processes.entry(parent).or_insert_with(|| Process::new(parent));
-                parent.children.push(child);
+                processes
+                    .entry(parent)
+                    .or_insert_with(|| new_process(parent))
+                    .children.push(child);
                 processes
                     .entry(child)
                     .or_insert_with(|| new_process(child));
             }
             Event::KilledBySignal { pid, signal, generated_core_dump, rusage: _rusage } => {
-                let process = processes.entry(pid).or_insert_with(|| new_process(pid));
-                process.exit = Some(ExitReason::KilledBySignal{ signal, generated_core_dump });
+                processes
+                    .entry(pid)
+                    .or_insert_with(|| new_process(pid))
+                    .exit = Some(ExitReason::KilledBySignal{ signal, generated_core_dump });
             }
             Event::NormalExit { pid, exit_code, rusage: _rusage } => {
-                let process = processes.entry(pid).or_insert_with(|| new_process(pid));
-                process.exit = Some(ExitReason::NormalExit{ exit_code });
+                processes
+                    .entry(pid)
+                    .or_insert_with(|| new_process(pid))
+                    .exit = Some(ExitReason::NormalExit{ exit_code });
             }
             Event::Exec { pid, args, rusage: _rusage } => {
-                // todo: former_thread_id, should I do anything with it? doesn't seem like I should?
                 let mut args: Vec<String> = args.split(|x| *x == 0u8).map(|arg| String::from_utf8_lossy(arg).to_string()).collect();
                 if let Some(last) = args.last() {
                     if last.is_empty() {
                         args.pop(); // get rid of the last entry (we split by '\0' but it's really '\0'-ended chunks)
                     }
                 };
-                let process = processes.entry(pid).or_insert_with(|| new_process(pid));
-                process.execvs.push(args);
+                processes
+                    .entry(pid)
+                    .or_insert_with(|| new_process(pid))
+                    .execvs.push(args);
             }
         }
     }

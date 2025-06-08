@@ -10,7 +10,7 @@ use crate::{
     TERMINATION_SIGNAL_CAUGHT
 };
 use libc::{PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK, PTRACE_EVENT_CLONE};
-use nix::sys::{ptrace, signal, signal::Signal, wait::WaitStatus};
+use nix::sys::{ptrace, signal::{self, Signal}, wait::{WaitPidFlag, WaitStatus}};
 use nix::unistd::Pid;
 use nix::{
     errno::Errno::ECHILD,
@@ -18,7 +18,6 @@ use nix::{
     sys::wait::WaitStatus::{Exited, PtraceEvent, PtraceSyscall, Signaled, Stopped}
 };
 use std::collections::HashMap;
-use std::hash::Hash;
 use std::sync::atomic::Ordering;
 use WaitResult::{GotTerminationSignal, Result, WaitpidErr};
 
@@ -73,7 +72,7 @@ fn waitpid_or_signal(rusage: &mut libc::rusage) -> WaitResult {
          */
 
         // use __WALL to wait for all child threads, not only thread group leaders ("processes")
-        match wait4(None, Some(nix::sys::wait::WaitPidFlag::__WALL), rusage) {
+        match wait4(None, Some(WaitPidFlag::__WALL), rusage) {
             Ok(result) => return Result(result),
             Err(nix::errno::Errno::EINTR) => {}
             Err(err) => return WaitpidErr(err),
