@@ -1,6 +1,7 @@
+use crate::sys_linux::{proc::process_stat,
+                       ptrace_syscall_info::{SyscallEntry, SyscallInfo, ptrace_get_syscall_info}};
+use nix::errno::Errno;
 use std::os::fd::OwnedFd;
-use crate::sys_linux::proc::process_stat;
-use crate::sys_linux::ptrace_syscall_info::{ptrace_get_syscall_info, SyscallEntry, SyscallInfo};
 
 #[derive(Clone, Copy)]
 pub(crate) struct Tracee {
@@ -9,9 +10,9 @@ pub(crate) struct Tracee {
 
 pub(crate) struct ArgvEnvpAddrs {
     pub(crate) argv_start: u64,
-    pub(crate) argv_end: u64,
+    pub(crate) argv_end:   u64,
     pub(crate) envp_start: u64,
-    pub(crate) envp_end: u64,
+    pub(crate) envp_end:   u64,
 }
 
 pub(crate) enum PokeResult {
@@ -53,10 +54,9 @@ impl Tracee {
     pub(crate) fn poke(self, memory: &[u64], address: usize) -> PokeResult {
         use nix::errno::Errno::{EFAULT, EIO, ENOSYS, EPERM, ESRCH};
 
-        let len_bytes = memory.len() * size_of::<u64>();
         match self.poke_writev(memory, address) {
             // everything is alright
-            Ok(result) if result == len_bytes => PokeResult::Ok,
+            Ok(result) if result == std::mem::size_of_val(memory) => PokeResult::Ok,
             // partial write, doesn't usually happen, strace ignores and logs it
             Ok(_) => self.poke_ptrace(memory, address),
             // process_vm_writev is unavailable for us
@@ -71,13 +71,13 @@ impl Tracee {
     }
 
     // Copied from https://github.com/coord-e/magicpak/blob/19b8e0db28bb1eb7959e38bf2273be02ab1cdb03/src/base/trace.rs#L160-L174
-    pub(crate) fn getregset(self) -> Result<libc::user_regs_struct, nix::errno::Errno> {
+    pub(crate) fn getregset(self) -> Result<libc::user_regs_struct, Errno> {
         let mut data = std::mem::MaybeUninit::<libc::user_regs_struct>::uninit();
 
         // ptrace can (and will) modify this iovec, has to be mut
         let mut iov = libc::iovec {
             iov_base: data.as_mut_ptr() as *mut libc::c_void,
-            iov_len: size_of::<libc::user_regs_struct>(),
+            iov_len:  size_of::<libc::user_regs_struct>(),
         };
 
         let res = unsafe {
@@ -88,7 +88,7 @@ impl Tracee {
                 &mut iov as *mut libc::iovec, // ptrace() can modify this iovec
             )
         };
-        nix::errno::Errno::result(res)?;
+        Errno::result(res)?;
 
         Ok(unsafe { data.assume_init() })
     }
@@ -96,12 +96,12 @@ impl Tracee {
     fn setregset(self, mut regset: libc::user_regs_struct) -> nix::Result<()> {
         let mut iov = libc::iovec {
             iov_base: &mut regset as *mut libc::user_regs_struct as *mut libc::c_void,
-            iov_len: size_of::<libc::user_regs_struct>(),
+            iov_len:  size_of::<libc::user_regs_struct>(),
         };
 
         let res = unsafe { libc::ptrace(libc::PTRACE_SETREGSET, self.pid, libc::NT_PRSTATUS, &mut iov as *mut libc::iovec) };
 
-        nix::errno::Errno::result(res)?;
+        Errno::result(res)?;
         Ok(())
     }
 
@@ -109,16 +109,16 @@ impl Tracee {
     fn setsyscall(self, syscall: libc::c_int) -> nix::Result<()> {
         let mut iov = libc::iovec {
             iov_base: &syscall as *const libc::c_int as *mut libc::c_void,
-            iov_len: size_of::<libc::c_int>(),
+            iov_len:  size_of::<libc::c_int>(),
         };
 
         let res = unsafe { libc::ptrace(libc::PTRACE_SETREGSET, self.pid, NT_ARM_SYSTEM_CALL, &mut iov as *mut libc::iovec) };
 
-        nix::errno::Errno::result(res)?;
+        Errno::result(res)?;
         Ok(())
     }
 
-    pub(crate) fn argv_envp_addrs(self) -> Result<(Option<ArgvEnvpAddrs>, OwnedFd), std::io::Error> {
+    pub(crate) fn argv_envp_addrs(self) -> Result<(Option<ArgvEnvpAddrs>, OwnedFd), Errno> {
         use bstr::ByteSlice;
 
         let (bytes, fd) = process_stat(self.pid)?;
@@ -127,20 +127,22 @@ impl Tracee {
             Some(x) => x + 2,
             None => return Ok((None, fd)),
         };
-        let addrs: Vec<u64> = bytes[after_rparen_idx..]
-            .split(|b| *b == b' ')
-            .skip(45)
-            .take(4)
-            .map(|part: &[u8]| std::str::from_utf8(part).unwrap_or("")) // todo: don't unwrap like that
-            .map(|part: &str| u64::from_str_radix(part, 10).unwrap_or(0)) // todo: don't unwrap like that, use an option
-            .collect();
+        let addrs: Vec<u64> = {
+            bytes[after_rparen_idx..]
+                .split(|b| *b == b' ')
+                .skip(45)
+                .take(4)
+                .map(|part: &[u8]| std::str::from_utf8(part).unwrap_or("")) // todo: don't unwrap like that
+                .map(|part: &str| u64::from_str_radix(part, 10).unwrap_or(0)) // todo: don't unwrap like that, use an option
+                .collect()
+        };
 
         Ok((
             Some(ArgvEnvpAddrs {
                 argv_start: addrs[0],
-                argv_end: addrs[1],
+                argv_end:   addrs[1],
                 envp_start: addrs[2],
-                envp_end: addrs[3],
+                envp_end:   addrs[3],
             }),
             fd,
         ))

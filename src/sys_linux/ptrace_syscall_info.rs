@@ -2,8 +2,7 @@
 
 use libc::c_long;
 use nix::unistd::Pid;
-use std::mem::MaybeUninit;
-use std::mem::size_of;
+use std::mem::{MaybeUninit, size_of};
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const PTRACE_GET_SYSCALL_INFO: u32 = 0x420e;
@@ -26,47 +25,47 @@ enum OpType {
 #[repr(C)]
 #[derive(Copy, Clone)] // have to in order to use this in a union
 struct RawEntry {
-    nr: u64,
+    nr:   u64,
     args: [u64; 6],
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)] // have to in order to use this in a union
 struct RawExit {
-    rval: i64,
+    rval:     i64,
     is_error: u8,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)] // have to in order to use this in a union
 struct RawSeccomp {
-    nr: u64,
-    args: [u64; 6],
+    nr:       u64,
+    args:     [u64; 6],
     ret_data: u32,
 }
 
 #[repr(C)]
 union RawData {
-    entry: RawEntry,
-    exit: RawExit,
+    entry:   RawEntry,
+    exit:    RawExit,
     seccomp: RawSeccomp,
 }
 
 /// equivalent to `ptrace_syscall_info`
 #[repr(C)]
 struct RawInfo {
-    op: OpType,
-    _pad: [u8; 3],
-    arch: u32,
+    op:                  OpType,
+    _pad:                [u8; 3],
+    arch:                u32,
     instruction_pointer: u64,
-    stack_pointer: u64,
-    data: RawData,
+    stack_pointer:       u64,
+    data:                RawData,
 }
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) struct SyscallEntry {
-    pub(crate) nr: u64,        /* System call number */
+    pub(crate) nr:   u64,      /* System call number */
     pub(crate) args: [u64; 6], /* System call arguments */
 }
 #[derive(Clone, Debug)]
@@ -82,9 +81,9 @@ pub(crate) struct SyscallExit {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) struct SyscallSeccomp {
-    pub(crate) nr: u64,        /* System call number */
-    pub(crate) args: [u64; 6], /* System call arguments */
-    pub(crate) ret_data: u32,  /* SECCOMP_RET_DATA portion of SECCOMP_RET_TRACE return value */
+    pub(crate) nr:       u64,      /* System call number */
+    pub(crate) args:     [u64; 6], /* System call arguments */
+    pub(crate) ret_data: u32,      /* SECCOMP_RET_DATA portion of SECCOMP_RET_TRACE return value */
 }
 
 #[derive(Clone, Debug)]
@@ -100,10 +99,10 @@ pub(crate) enum SyscallOp {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) struct SyscallInfo {
-    pub(crate) arch: u32,                /* AUDIT_ARCH_* value; see seccomp(2) */
+    pub(crate) arch:                u32, /* AUDIT_ARCH_* value; see seccomp(2) */
     pub(crate) instruction_pointer: u64, /* CPU instruction pointer */
-    pub(crate) stack_pointer: u64,       /* CPU stack pointer */
-    pub(crate) op: SyscallOp,
+    pub(crate) stack_pointer:       u64, /* CPU stack pointer */
+    pub(crate) op:                  SyscallOp,
 }
 
 fn parse_raw_data(info: RawInfo) -> Option<SyscallOp> {
@@ -116,15 +115,15 @@ fn parse_raw_data(info: RawInfo) -> Option<SyscallOp> {
         OpType::PTRACE_SYSCALL_INFO_EXIT => {
             let exit = unsafe { info.data.exit };
             Some(SyscallOp::Exit(SyscallExit {
-                rval: exit.rval,
+                rval:     exit.rval,
                 is_error: exit.is_error,
             }))
         }
         OpType::PTRACE_SYSCALL_INFO_SECCOMP => {
             let seccomp = unsafe { info.data.seccomp };
             Some(SyscallOp::Seccomp(SyscallSeccomp {
-                nr: seccomp.nr,
-                args: seccomp.args,
+                nr:       seccomp.nr,
+                args:     seccomp.args,
                 ret_data: seccomp.ret_data,
             }))
         }
@@ -134,10 +133,10 @@ fn parse_raw_data(info: RawInfo) -> Option<SyscallOp> {
 
 fn parse_raw_info(raw: RawInfo) -> Option<SyscallInfo> {
     Some(SyscallInfo {
-        arch: raw.arch,
+        arch:                raw.arch,
         instruction_pointer: raw.instruction_pointer,
-        stack_pointer: raw.stack_pointer,
-        op: parse_raw_data(raw)?,
+        stack_pointer:       raw.stack_pointer,
+        op:                  parse_raw_data(raw)?,
     })
 }
 

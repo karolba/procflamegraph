@@ -1,18 +1,13 @@
-use crate::errors::error_out;
-use crate::output_peeker::ChildPeekResult;
-use crate::tracer::Event;
-use crate::{args, ExitReason};
+use crate::{ExitReason, args, errors::error_out, output_peeker::ChildPeekResult, tracer::Event};
 use nix::unistd::Pid;
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::error::Error;
-use std::fs::File;
-use std::io::{stdout, BufWriter, Write};
-use std::time::SystemTime;
-use struson::writer::simple::ObjectWriter;
-use struson::writer::simple::SimpleJsonWriter;
-use struson::writer::simple::ValueWriter;
-use struson::writer::JsonStreamWriter;
+use std::{borrow::Cow,
+          collections::HashMap,
+          error::Error,
+          fs::File,
+          io::{BufWriter, Write, stdout},
+          time::SystemTime};
+use struson::writer::{JsonStreamWriter,
+                      simple::{ObjectWriter, SimpleJsonWriter, ValueWriter}};
 
 // todo: is there a builtin for this?
 macro_rules! yield_from {
@@ -29,13 +24,15 @@ macro_rules! yield_from {
 
 #[derive(Debug)]
 pub(crate) struct Process {
-    pid: Pid,
-    children: Vec<Pid>,
-    execvs: Vec<Vec<String>>,
-    exit: Option<ExitReason>,
+    pid:                Pid,
+    children:           Vec<Pid>,
+    execvs:             Vec<Vec<String>>,
+    exit:               Option<ExitReason>,
     child_peek_results: Option<ChildPeekResult>,
-    #[allow(dead_code)] start_time: Option<SystemTime>,
-    #[allow(dead_code)] stop_time: Option<SystemTime>, // todo: use those? or rusage
+    #[allow(dead_code)]
+    start_time:         Option<SystemTime>,
+    #[allow(dead_code)]
+    stop_time:          Option<SystemTime>, // todo: use those? or rusage
 }
 
 type JsonObjectWriter<'a, 'b> = ObjectWriter<'a, JsonStreamWriter<&'b mut Box<dyn Write>>>;
@@ -107,15 +104,25 @@ impl Process {
                             Ok(())
                         })?;
 
-                        if let Some(child_peek_result) = &self.child_peek_results
-                            && let ChildPeekResult{data} = child_peek_result
-                            && let Some(instance_result) = data.get(i)
-                            && !instance_result.is_empty()
-                        {
-                            j.write_string_member_with_writer("capturedStderr", |mut w| {
-                                w.write(instance_result.as_slice())?;
-                                Ok(())
-                            })?;
+                        if let Some(child_peek_result) = &self.child_peek_results {
+                            let ChildPeekResult { stdout_data, stderr_data } = child_peek_result;
+
+                            if let Some(instance_result) = stdout_data.get(i)
+                                && !instance_result.is_empty()
+                            {
+                                j.write_string_member_with_writer("capturedStdout", |mut w| {
+                                    w.write_all(instance_result.as_slice())?;
+                                    Ok(())
+                                })?;
+                            }
+                            if let Some(instance_result) = stderr_data.get(i)
+                                && !instance_result.is_empty()
+                            {
+                                j.write_string_member_with_writer("capturedStderr", |mut w| {
+                                    w.write_all(instance_result.as_slice())?;
+                                    Ok(())
+                                })?;
+                            }
                         }
                         Ok(())
                     })?;
@@ -126,15 +133,15 @@ impl Process {
 
         match self.exit {
             None => j.write_string_member("exit", "unknown")?,
-            Some(ExitReason::NormalExit {exit_code}) => j.write_object_member("exit", |j| {
+            Some(ExitReason::NormalExit { exit_code }) => j.write_object_member("exit", |j| {
                 j.write_number_member("code", exit_code)?;
                 Ok(())
             })?,
-            Some(ExitReason::KilledBySignal {signal, generated_core_dump: false}) => j.write_object_member("exit", |j| {
+            Some(ExitReason::KilledBySignal { signal, generated_core_dump: false }) => j.write_object_member("exit", |j| {
                 j.write_string_member("killedBySignal", signal.as_str())?;
                 Ok(())
             })?,
-            Some(ExitReason::KilledBySignal {signal, generated_core_dump: true}) => j.write_object_member("exit", |j| {
+            Some(ExitReason::KilledBySignal { signal, generated_core_dump: true }) => j.write_object_member("exit", |j| {
                 j.write_string_member("killedBySignal", signal.as_str())?;
                 j.write_bool_member("generatedCoreDump", true)?;
                 Ok(())
@@ -144,9 +151,7 @@ impl Process {
         let mut children = self.flattened_children(others);
         if let Some(first_child) = children.next() {
             j.write_array_member("children", |j| {
-                j.write_object(|j| {
-                    first_child.write_json(others, j)
-                })?;
+                j.write_object(|j| first_child.write_json(others, j))?;
 
                 for child in children {
                     j.write_object(|j| {
@@ -179,34 +184,44 @@ pub(crate) fn events_to_processes(events: Vec<Event>, mut captured_output: HashM
                 processes
                     .entry(parent)
                     .or_insert_with(|| new_process(parent))
-                    .children.push(child);
+                    .children
+                    .push(child);
                 processes
                     .entry(child)
                     .or_insert_with(|| new_process(child));
             }
-            Event::KilledBySignal { pid, signal, generated_core_dump, rusage: _rusage } => {
-                processes
+            Event::KilledBySignal {
+                pid,
+                signal,
+                generated_core_dump,
+                rusage: _rusage,
+            } => {
+                let proc = processes
                     .entry(pid)
-                    .or_insert_with(|| new_process(pid))
-                    .exit = Some(ExitReason::KilledBySignal{ signal, generated_core_dump });
+                    .or_insert_with(|| new_process(pid));
+                proc.exit = Some(ExitReason::KilledBySignal { signal, generated_core_dump });
             }
             Event::NormalExit { pid, exit_code, rusage: _rusage } => {
-                processes
+                let proc = processes
                     .entry(pid)
-                    .or_insert_with(|| new_process(pid))
-                    .exit = Some(ExitReason::NormalExit{ exit_code });
+                    .or_insert_with(|| new_process(pid));
+                proc.exit = Some(ExitReason::NormalExit { exit_code });
             }
             Event::Exec { pid, args, rusage: _rusage } => {
-                let mut args: Vec<String> = args.split(|x| *x == 0u8).map(|arg| String::from_utf8_lossy(arg).to_string()).collect();
-                if let Some(last) = args.last() {
-                    if last.is_empty() {
-                        args.pop(); // get rid of the last entry (we split by '\0' but it's really '\0'-ended chunks)
-                    }
+                let mut args: Vec<String> = args
+                    .split(|x| *x == 0u8)
+                    .map(|arg| String::from_utf8_lossy(arg).to_string())
+                    .collect();
+                if let Some(last) = args.last()
+                    && last.is_empty()
+                {
+                    args.pop(); // get rid of the last entry (we split by '\0' but it's really '\0'-ended chunks)
                 };
                 processes
                     .entry(pid)
                     .or_insert_with(|| new_process(pid))
-                    .execvs.push(args);
+                    .execvs
+                    .push(args);
             }
         }
     }
@@ -226,7 +241,9 @@ fn have_to_write<E: Into<Box<dyn Error>>>(result: Result<(), E>) {
 }
 
 pub(crate) fn output_process_tree(root_child_pid: Pid, processes: HashMap<Pid, Process>) -> Option<ExitReason> {
-    let root = processes.get(&root_child_pid).expect("Our only child is not in children (??)");
+    let root = processes
+        .get(&root_child_pid)
+        .expect("Our only child is not in children (??)");
 
     let mut output: Box<dyn Write> = match &args().output_file {
         None => Box::new(BufWriter::new(stdout())),
@@ -237,9 +254,7 @@ pub(crate) fn output_process_tree(root_child_pid: Pid, processes: HashMap<Pid, P
 
     if args().json_output {
         let writer = SimpleJsonWriter::new(&mut output);
-        have_to_write(writer.write_object(|object_writer| {
-            root.write_json(&processes, object_writer)
-        }));
+        have_to_write(writer.write_object(|object_writer| root.write_json(&processes, object_writer)));
         have_to_write(output.write(b"\n").map(drop)); // todo: this is after a flush, somehow inhibit the first one
     } else {
         have_to_write(root.write_human_readable_tree(0, &processes, &mut output));

@@ -4,29 +4,23 @@
 mod args;
 mod coroutines;
 mod errors;
+mod output;
 mod output_peeker;
 mod sys_linux;
 mod take_over_process;
 mod tracer;
-mod output;
 
-use crate::{
-    output::events_to_processes,
-    errors::log_warn,
-    output::output_process_tree,
-    sys_linux::kernel_version::kernel_major_minor,
-    tracer::waitpid_loop
-};
-use nix::{
-    sys::{ptrace, signal::Signal},
-    unistd::{fork, ForkResult},
-};
-use std::{
-    ffi::CString,
-    process::ExitCode,
-    sync::atomic::{AtomicBool, Ordering},
-    sync::OnceLock,
-};
+use crate::{errors::{error_out, log_warn},
+            output::{events_to_processes, output_process_tree},
+            sys_linux::kernel_version::kernel_major_minor,
+            tracer::waitpid_loop};
+use nix::{sys::{ptrace, signal::{self, raise, Signal}},
+          unistd::{execvp, fork, ForkResult}};
+use std::{ffi::CString,
+          os::unix::ffi::OsStrExt,
+          process::ExitCode,
+          sync::{OnceLock,
+                 atomic::{AtomicBool, Ordering}}};
 
 static ARGS: OnceLock<args::Args> = OnceLock::new();
 pub(crate) fn args() -> &'static args::Args {
@@ -54,15 +48,17 @@ enum ExitReason {
     KilledBySignal { signal: Signal, generated_core_dump: bool },
 }
 
-
 #[derive(PartialEq)]
 enum ExecTracedChildOptions {
     TryToReexecOnPtracemeEPERM,
     DoNotTryToReexecOnPtracemeEPERM,
 }
 fn exec_traced_child(opts: ExecTracedChildOptions) -> ! {
-    use std::os::unix::ffi::OsStrExt;
-    let child_args: Vec<CString> = args().command.iter().map(|osstr| CString::new(osstr.as_bytes()).unwrap()).collect();
+    let child_args: Vec<CString> = args()
+        .command
+        .iter()
+        .map(|osstr| CString::new(osstr.as_bytes()).unwrap())
+        .collect();
 
     match ptrace::traceme() {
         Err(nix::errno::Errno::EPERM) if opts == ExecTracedChildOptions::TryToReexecOnPtracemeEPERM => {
@@ -72,13 +68,13 @@ fn exec_traced_child(opts: ExecTracedChildOptions) -> ! {
             let reexec_args = [
                 vec![
                     CString::new(args().our_name.clone()).unwrap(),
-                    c"--_reexec-ptraceme".into(),
-                    c"--".into(),
+                    c"--_reexec-ptraceme".to_owned(),
+                    c"--".to_owned()
                 ],
                 child_args.clone()
             ].concat();
 
-            nix::unistd::execvp(c"/proc/self/exe", &reexec_args).expect("couldn't reexec myself");
+            execvp(c"/proc/self/exe", &reexec_args).expect("couldn't reexec myself");
             unreachable!();
         }
         result => {
@@ -88,15 +84,23 @@ fn exec_traced_child(opts: ExecTracedChildOptions) -> ! {
     }
 
     // Stop ourselves so our tracer parent can set up PTRACE_SETOPTIONS on us
-    nix::sys::signal::raise(Signal::SIGSTOP).expect("raise(SIGSTOP) failed");
+    raise(Signal::SIGSTOP).expect("raise(SIGSTOP) failed");
 
     // todo: better errors if execve fails
     //       and return with -127 then
-    nix::unistd::execvp(child_args.get(0).expect("need to pass at least one arg"), &child_args).expect("execve failed");
+    execvp(
+        child_args
+            .get(0)
+            .expect("need to pass at least one arg"),
+        &child_args,
+    )
+    .unwrap_or_else(|err| {
+        error_out!("could not execute {}: {}", child_args.first().unwrap().to_string_lossy(), err.desc())
+    });
     unreachable!();
 }
 
-fn run_in_fork<F: FnOnce() -> ()>(run_child: F) -> nix::unistd::Pid {
+fn run_in_fork<F: FnOnce()>(run_child: F) -> nix::unistd::Pid {
     // safety: can really only call this function when no more than 1 thread is yet to run
     // (calling fork ourselves is not thread-safe)
     match unsafe { fork() }.expect("fork() failed") {
@@ -115,7 +119,6 @@ extern "C" fn sigaction_handler(_signal: libc::c_int) {
 }
 
 fn setup_termination_signal_handler() {
-    use nix::sys::signal;
 
     let sigaction = signal::SigAction::new(
         signal::SigHandler::Handler(sigaction_handler),
@@ -138,8 +141,6 @@ fn setup_termination_signal_handler() {
 }
 
 fn ignore_termination_signals() {
-    use nix::sys::signal;
-
     let ignore_sigaction = signal::SigAction::new(signal::SigHandler::SigIgn, signal::SaFlags::empty(), signal::SigSet::empty());
     unsafe { signal::sigaction(signal::SIGTERM, &ignore_sigaction) }.expect("Couldn't reset the SIGTERM handler");
     unsafe { signal::sigaction(signal::SIGINT, &ignore_sigaction) }.expect("Couldn't reset the SIGINT handler");
@@ -158,7 +159,6 @@ fn warn_on_an_old_kernel() {
         log_warn!("The lowest required Linux version is 5.6 - you are running {}.{}", major, minor);
     }
 }
-
 
 fn main() -> ExitCode {
     ARGS.set(args::parse_args()).ok();
@@ -189,7 +189,7 @@ fn main() -> ExitCode {
 
     ExitCode::from(match root_process_exit {
         None => 1,
-        Some(ExitReason::NormalExit {exit_code}) => exit_code as u8,
-        Some(ExitReason::KilledBySignal {signal, ..}) => (128 + (signal as i32)) as u8
+        Some(ExitReason::NormalExit { exit_code }) => exit_code as u8,
+        Some(ExitReason::KilledBySignal { signal, .. }) => (128 + (signal as i32)) as u8,
     })
 }
