@@ -14,8 +14,9 @@ use crate::{errors::{error_out, log_warn},
             output::{events_to_processes, output_process_tree},
             sys_linux::kernel_version::kernel_major_minor,
             tracer::waitpid_loop};
-use nix::{sys::{ptrace, signal::{self, raise, Signal}},
-          unistd::{execvp, fork, ForkResult}};
+use nix::{sys::{ptrace,
+                signal::{self, Signal, raise}},
+          unistd::{ForkResult, execvp, fork}};
 use std::{ffi::CString,
           os::unix::ffi::OsStrExt,
           process::ExitCode,
@@ -65,14 +66,8 @@ fn exec_traced_child(opts: ExecTracedChildOptions) -> ! {
             // we might be being ptraced ourselves
             // to support running under `strace -f -b execve` let's reexec ourselves and try doing PTRACE_TRACEME again then
 
-            let reexec_args = [
-                vec![
-                    CString::new(args().our_name.clone()).unwrap(),
-                    c"--_reexec-ptraceme".to_owned(),
-                    c"--".to_owned()
-                ],
-                child_args.clone()
-            ].concat();
+            let prefix_args_with = vec![CString::new(args().our_name.clone()).unwrap(), c"--_reexec-ptraceme".to_owned(), c"--".to_owned()];
+            let reexec_args = [prefix_args_with, child_args.clone()].concat();
 
             execvp(c"/proc/self/exe", &reexec_args).expect("couldn't reexec myself");
             unreachable!();
@@ -95,7 +90,14 @@ fn exec_traced_child(opts: ExecTracedChildOptions) -> ! {
         &child_args,
     )
     .unwrap_or_else(|err| {
-        error_out!("could not execute {}: {}", child_args.first().unwrap().to_string_lossy(), err.desc())
+        error_out!(
+            "could not execute {}: {}",
+            child_args
+                .first()
+                .unwrap()
+                .to_string_lossy(),
+            err.desc()
+        )
     });
     unreachable!();
 }
@@ -119,7 +121,6 @@ extern "C" fn sigaction_handler(_signal: libc::c_int) {
 }
 
 fn setup_termination_signal_handler() {
-
     let sigaction = signal::SigAction::new(
         signal::SigHandler::Handler(sigaction_handler),
         // Note: Intentionally don't specify SA_RESTART, which means many syscalls

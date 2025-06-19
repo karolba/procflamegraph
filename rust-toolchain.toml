@@ -4,6 +4,7 @@ channel = "nightly-2025-05-24"
 components = [
     "rust-src", # To be able to compile the std library ourselves for a 50% binary size reduction
     "rustfmt",
+    "clippy"
 ]
 
 targets = [

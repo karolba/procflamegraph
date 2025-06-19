@@ -1,11 +1,12 @@
 use crate::{ExitReason, args, errors::error_out, output_peeker::ChildPeekResult, tracer::Event};
-use nix::unistd::Pid;
+use nix::{sys::time::{TimeSpec, TimeVal},
+          unistd::Pid};
 use std::{borrow::Cow,
           collections::HashMap,
           error::Error,
           fs::File,
           io::{BufWriter, Write, stdout},
-          time::SystemTime};
+          iter::zip};
 use struson::writer::{JsonStreamWriter,
                       simple::{ObjectWriter, SimpleJsonWriter, ValueWriter}};
 
@@ -23,16 +24,27 @@ macro_rules! yield_from {
 }
 
 #[derive(Debug)]
+struct Rusage {
+    utime: TimeVal,
+    stime: TimeVal,
+}
+
+#[derive(Debug)]
+struct Execve {
+    cmdline:         Vec<String>,
+    started_at:      TimeSpec,
+    captured_stdout: Option<Vec<u8>>,
+    captured_stderr: Option<Vec<u8>>,
+    rusage_at_end:   Option<Rusage>,
+}
+
+#[derive(Debug)]
 pub(crate) struct Process {
-    pid:                Pid,
-    children:           Vec<Pid>,
-    execvs:             Vec<Vec<String>>,
-    exit:               Option<ExitReason>,
-    child_peek_results: Option<ChildPeekResult>,
-    #[allow(dead_code)]
-    start_time:         Option<SystemTime>,
-    #[allow(dead_code)]
-    stop_time:          Option<SystemTime>, // todo: use those? or rusage
+    pid:       Pid,
+    children:  Vec<Pid>,
+    execvs:    Vec<Execve>,
+    exit:      Option<ExitReason>,
+    exit_time: Option<TimeSpec>,
 }
 
 type JsonObjectWriter<'a, 'b> = ObjectWriter<'a, JsonStreamWriter<&'b mut Box<dyn Write>>>;
@@ -44,9 +56,7 @@ impl Process {
             children: vec![],
             execvs: vec![],
             exit: None,
-            child_peek_results: None,
-            start_time: None,
-            stop_time: None,
+            exit_time: None,
         }
     }
 
@@ -95,34 +105,49 @@ impl Process {
 
         if !self.execvs.is_empty() {
             j.write_array_member("execves", |j| {
-                for (i, execve) in self.execvs.iter().enumerate() {
+                for execve in self.execvs.iter() {
                     j.write_object(|j| {
                         j.write_array_member("argv", |j| {
-                            for arg in execve.iter() {
+                            for arg in execve.cmdline.iter() {
                                 j.write_string(arg.as_str())?;
                             }
                             Ok(())
                         })?;
 
-                        if let Some(child_peek_result) = &self.child_peek_results {
-                            let ChildPeekResult { stdout_data, stderr_data } = child_peek_result;
+                        j.write_object_member("started_at", |j| {
+                            j.write_string_member("sec", &execve.started_at.tv_sec().to_string())?;
+                            j.write_string_member("nsec", &execve.started_at.tv_nsec().to_string())?;
+                            Ok(())
+                        })?;
 
-                            if let Some(instance_result) = stdout_data.get(i)
-                                && !instance_result.is_empty()
-                            {
-                                j.write_string_member_with_writer("capturedStdout", |mut w| {
-                                    w.write_all(instance_result.as_slice())?;
+                        if let Some(rusage_at_end) = &execve.rusage_at_end {
+                            j.write_object_member("rusage", |j| {
+                                j.write_object_member("utime", |j| {
+                                    j.write_string_member("sec", &rusage_at_end.utime.tv_sec().to_string())?;
+                                    j.write_string_member("usec", &rusage_at_end.utime.tv_usec().to_string())?;
                                     Ok(())
                                 })?;
-                            }
-                            if let Some(instance_result) = stderr_data.get(i)
-                                && !instance_result.is_empty()
-                            {
-                                j.write_string_member_with_writer("capturedStderr", |mut w| {
-                                    w.write_all(instance_result.as_slice())?;
+                                j.write_object_member("stime", |j| {
+                                    j.write_string_member("sec", &rusage_at_end.stime.tv_sec().to_string())?;
+                                    j.write_string_member("usec", &rusage_at_end.stime.tv_usec().to_string())?;
                                     Ok(())
                                 })?;
-                            }
+                                Ok(())
+                            })?;
+                        }
+
+                        if let Some(captured_stdout) = &execve.captured_stdout {
+                            j.write_string_member_with_writer("capturedStdout", |mut w| {
+                                w.write_all(captured_stdout.as_slice())?;
+                                Ok(())
+                            })?;
+                        }
+
+                        if let Some(captured_stderr) = &execve.captured_stderr {
+                            j.write_string_member_with_writer("capturedStderr", |mut w| {
+                                w.write_all(captured_stderr.as_slice())?;
+                                Ok(())
+                            })?;
                         }
                         Ok(())
                     })?;
@@ -148,6 +173,14 @@ impl Process {
             })?,
         };
 
+        if let Some(exit_time) = self.exit_time {
+            j.write_object_member("exited_at", |j| {
+                j.write_string_member("sec", &exit_time.tv_sec().to_string())?;
+                j.write_string_member("nsec", &exit_time.tv_nsec().to_string())?;
+                Ok(())
+            })?;
+        }
+
         let mut children = self.flattened_children(others);
         if let Some(first_child) = children.next() {
             j.write_array_member("children", |j| {
@@ -167,69 +200,105 @@ impl Process {
     }
 }
 
-pub(crate) fn events_to_processes(events: Vec<Event>, mut captured_output: HashMap<Pid, ChildPeekResult>) -> HashMap<Pid, Process> {
+pub(crate) fn events_to_processes(events: Vec<Event>, captured_output: HashMap<Pid, ChildPeekResult>) -> HashMap<Pid, Process> {
     use crate::tracer::Event;
 
     let mut processes: HashMap<Pid, Process> = HashMap::new();
-
-    let mut new_process = |pid: Pid| -> Process {
-        let mut process = Process::new(pid);
-        process.child_peek_results = captured_output.remove(&pid);
-        process
-    };
 
     for event in events {
         match event {
             Event::NewChild { child, parent } => {
                 processes
                     .entry(parent)
-                    .or_insert_with(|| new_process(parent))
+                    .or_insert_with(|| Process::new(parent))
                     .children
                     .push(child);
                 processes
                     .entry(child)
-                    .or_insert_with(|| new_process(child));
+                    .or_insert_with(|| Process::new(child));
             }
             Event::KilledBySignal {
                 pid,
                 signal,
                 generated_core_dump,
-                rusage: _rusage,
+                time,
+                ru_utime,
+                ru_stime,
             } => {
-                let proc = processes
+                let process = processes
                     .entry(pid)
-                    .or_insert_with(|| new_process(pid));
-                proc.exit = Some(ExitReason::KilledBySignal { signal, generated_core_dump });
+                    .or_insert_with(|| Process::new(pid));
+                if let Some(last_execve) = process.execvs.last_mut() {
+                    last_execve.rusage_at_end = Some(Rusage { utime: ru_utime, stime: ru_stime })
+                }
+                process.exit = Some(ExitReason::KilledBySignal { signal, generated_core_dump });
+                process.exit_time = Some(time);
             }
-            Event::NormalExit { pid, exit_code, rusage: _rusage } => {
-                let proc = processes
+            Event::NormalExit {
+                pid,
+                exit_code,
+                time,
+                ru_utime,
+                ru_stime,
+            } => {
+                let process = processes
                     .entry(pid)
-                    .or_insert_with(|| new_process(pid));
-                proc.exit = Some(ExitReason::NormalExit { exit_code });
+                    .or_insert_with(|| Process::new(pid));
+                if let Some(last_execve) = process.execvs.last_mut() {
+                    last_execve.rusage_at_end = Some(Rusage { utime: ru_utime, stime: ru_stime })
+                }
+                process.exit = Some(ExitReason::NormalExit { exit_code });
+                process.exit_time = Some(time);
             }
-            Event::Exec { pid, args, rusage: _rusage } => {
-                let mut args: Vec<String> = args
-                    .split(|x| *x == 0u8)
-                    .map(|arg| String::from_utf8_lossy(arg).to_string())
-                    .collect();
-                if let Some(last) = args.last()
-                    && last.is_empty()
-                {
-                    args.pop(); // get rid of the last entry (we split by '\0' but it's really '\0'-ended chunks)
-                };
-                processes
+            Event::Exec { pid, args, time, ru_utime, ru_stime } => {
+                let process = processes
                     .entry(pid)
-                    .or_insert_with(|| new_process(pid))
-                    .execvs
-                    .push(args);
+                    .or_insert_with(|| Process::new(pid));
+                
+                if let Some(last_execve) = process.execvs.last_mut() {
+                    last_execve.rusage_at_end = Some(Rusage { utime: ru_utime, stime: ru_stime })
+                }
+
+                process.execvs.push(Execve {
+                    cmdline:         parse_proc_cmdline(args),
+                    started_at:      time,
+                    captured_stdout: None,
+                    captured_stderr: None,
+                    rusage_at_end:   None,
+                });
             }
+        }
+    }
+
+    for (pid, captured_for_each_execve) in captured_output {
+        let process = &mut processes.get_mut(&pid).unwrap();
+        for (execve, captured_stdout_for_execve) in zip(&mut process.execvs, captured_for_each_execve.stdout_data) {
+            execve.captured_stdout = Some(captured_stdout_for_execve);
+        }
+        for (execve, captured_stderr_for_execve) in zip(&mut process.execvs, captured_for_each_execve.stderr_data) {
+            execve.captured_stderr = Some(captured_stderr_for_execve);
         }
     }
 
     processes
 }
 
-fn have_to_write<E: Into<Box<dyn Error>>>(result: Result<(), E>) {
+fn parse_proc_cmdline(args: Vec<u8>) -> Vec<String> {
+    let mut args: Vec<String> = args
+        .split(|x| *x == 0u8)
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect();
+    if let Some(last) = args.last()
+        && last.is_empty()
+    {
+        // get rid of the last entry (we split by '\0' but linux really gives us '\0'-ended chunks)
+        // be tolerant if it's not a '\0'-ended chunk, as a process might be able to pass some garbage in
+        args.pop();
+    };
+    args
+}
+
+fn must_write_err<E: Into<Box<dyn Error>>>(result: Result<(), E>) {
     if let Err(error) = result {
         let filename = args()
             .output_file
@@ -254,14 +323,14 @@ pub(crate) fn output_process_tree(root_child_pid: Pid, processes: HashMap<Pid, P
 
     if args().json_output {
         let writer = SimpleJsonWriter::new(&mut output);
-        have_to_write(writer.write_object(|object_writer| root.write_json(&processes, object_writer)));
-        have_to_write(output.write(b"\n").map(drop)); // todo: this is after a flush, somehow inhibit the first one
+        must_write_err(writer.write_object(|object_writer| root.write_json(&processes, object_writer)));
+        must_write_err(output.write(b"\n").map(drop)); // todo: this is after a flush, somehow inhibit the first one
     } else {
-        have_to_write(root.write_human_readable_tree(0, &processes, &mut output));
+        must_write_err(root.write_human_readable_tree(0, &processes, &mut output));
     }
 
     // flush so we handle errors we'd otherwise ignore at closing
-    have_to_write(output.flush());
+    must_write_err(output.flush());
 
     let root_process_exit = root.exit.clone();
 

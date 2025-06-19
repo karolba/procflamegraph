@@ -9,39 +9,46 @@ use crate::{TERMINATION_SIGNAL_CAUGHT, args,
 use WaitResult::{GotTerminationSignal, Result, WaitpidErr};
 use libc::{PTRACE_EVENT_CLONE, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK};
 use nix::{errno::Errno::ECHILD,
-          sys::{ptrace, signal,
-                signal::{Signal,
-                         Signal::{SIGSTOP, SIGTRAP}},
-                wait::{WaitStatus,
-                       WaitStatus::{Exited, PtraceEvent, PtraceSyscall, Signaled, Stopped}}},
+          sys::{ptrace,
+                signal::{self,
+                         Signal::{self, SIGSTOP, SIGTRAP}},
+                time::{TimeSpec, TimeVal},
+                wait::WaitStatus::{self, Exited, PtraceEvent, PtraceSyscall, Signaled, Stopped}},
+          time::{ClockId, clock_gettime},
           unistd::Pid};
 use std::{collections::HashMap, sync::atomic::Ordering};
 
 #[derive(Debug)]
 pub(crate) enum Event {
     NewChild {
-        parent: nix::unistd::Pid,
-        child:  nix::unistd::Pid,
+        parent: Pid,
+        child:  Pid,
     },
     Exec {
-        rusage: libc::rusage,
-        pid:    nix::unistd::Pid,
-        args:   Vec<u8>,
+        time:     TimeSpec,
+        ru_utime: TimeVal,
+        ru_stime: TimeVal,
+        pid:      Pid,
+        args:     Vec<u8>,
     },
     NormalExit {
-        rusage:    libc::rusage,
-        pid:       nix::unistd::Pid,
+        time:      TimeSpec,
+        ru_utime:  TimeVal,
+        ru_stime:  TimeVal,
+        pid:       Pid,
         exit_code: i64,
     },
     KilledBySignal {
-        rusage:              libc::rusage,
-        pid:                 nix::unistd::Pid,
+        time:                TimeSpec,
+        ru_utime:            TimeVal,
+        ru_stime:            TimeVal,
+        pid:                 Pid,
         signal:              Signal,
         generated_core_dump: bool,
     },
 }
 
-fn setup_ptrace_for_child(child: nix::unistd::Pid) {
+fn setup_ptrace_for_child(child: Pid) {
     // todo: if this fails, then either:
     // - the process has received a SIGSTOP already but it wasn't from us  => don't care about this?
     //   there should be a second sigstop invoked from raise() anyway
@@ -93,7 +100,7 @@ fn waitpid_or_signal(rusage: &mut libc::rusage) -> WaitResult {
     }
 }
 
-fn is_special_secure_exe_screwed(pid: nix::unistd::Pid) -> bool {
+fn is_special_secure_exe_screwed(pid: Pid) -> bool {
     if args().test_always_detach {
         return true;
     }
@@ -114,7 +121,7 @@ fn is_special_secure_exe_screwed(pid: nix::unistd::Pid) -> bool {
     }
 }
 
-pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &OutputPeeker) -> Vec<Event> {
+pub(crate) fn waitpid_loop(_first_child: Pid, output_peeker: &OutputPeeker) -> Vec<Event> {
     // In this function, many syscalls can be interrupted by EINTR due to how signal handlers are set up
     // Make sure that's handled gracefully.
 
@@ -179,7 +186,13 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
                     cont(child, None).ok(); // ignore errors - the child could have died
                 }
 
-                events.push(Event::Exec { rusage, pid: child, args: cmdline });
+                events.push(Event::Exec {
+                    time:     clock_gettime(ClockId::CLOCK_MONOTONIC_COARSE).expect("clock_gettime(CLOCK_MONOTONIC_COARSE)"),
+                    ru_utime: TimeVal::from(rusage.ru_utime),
+                    ru_stime: TimeVal::from(rusage.ru_stime),
+                    pid:      child,
+                    args:     cmdline,
+                });
 
                 output_peeker.execve_happened(child);
             }
@@ -248,7 +261,9 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
             // a process exited normally
             Result(Exited(pid, exit_code)) => {
                 events.push(Event::NormalExit {
-                    rusage,
+                    time: clock_gettime(ClockId::CLOCK_MONOTONIC_COARSE).expect("clock_gettime(CLOCK_MONOTONIC_COARSE)"),
+                    ru_utime: TimeVal::from(rusage.ru_utime),
+                    ru_stime: TimeVal::from(rusage.ru_stime),
                     pid,
                     exit_code: exit_code as i64,
                 });
@@ -258,7 +273,9 @@ pub(crate) fn waitpid_loop(_first_child: nix::unistd::Pid, output_peeker: &Outpu
             // a process exited by being killed by a signal
             Result(Signaled(pid, signal, generated_core_dump)) => {
                 events.push(Event::KilledBySignal {
-                    rusage,
+                    time: clock_gettime(ClockId::CLOCK_MONOTONIC_COARSE).expect("clock_gettime(CLOCK_MONOTONIC_COARSE)"),
+                    ru_utime: TimeVal::from(rusage.ru_utime),
+                    ru_stime: TimeVal::from(rusage.ru_stime),
                     pid,
                     signal,
                     generated_core_dump,

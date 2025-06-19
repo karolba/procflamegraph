@@ -17,7 +17,6 @@ use std::{cell::RefCell,
 
 #[derive(Debug)]
 pub(crate) struct ChildPeekResult {
-    // pub(crate) data: Vec<u8>,
     pub(crate) stdout_data: Vec<Vec<u8>>,
     pub(crate) stderr_data: Vec<Vec<u8>>,
 }
