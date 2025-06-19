@@ -1,0 +1,14 @@
+group_imports = "One"
+imports_indent = "Visual"
+imports_granularity = "Crate"
+use_field_init_shorthand = true
+overflow_delimited_expr = true
+#indent_style = "Visual"
+struct_field_align_threshold = 25
+
+# Allow a bit wider lines than the default:
+max_width = 150
+use_small_heuristics = "Max"
+chain_width = 40
+struct_lit_width = 36
+single_line_if_else_max_width = 50
